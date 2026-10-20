@@ -1,0 +1,15 @@
+[package]
+name = "agent-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Pengjie Zhou"]
+description = "What a coding agent's session is doing, from its hooks' events and the files it leaves: Claude Code, Codex, Antigravity, OpenCode, oh-my-pi, ZCode, Reasonix, DeepSeek Harness."
+
+[dependencies]
+serde_json = "1"
+# DeepSeek Harness's session log read for its last reply (dsh.rs): a
+# Zstandard decoder in plain Rust, nothing under it (no checksums: "hash"
+# off). 78,848 bytes of Wakuwaku's release exe with the reading of the log
+# (11,452,416 before; 2026-10-16).
+ruzstd = { version = "=0.9.1", default-features = false, features = ["std"] }
