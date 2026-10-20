@@ -98,6 +98,24 @@ fn a_client_that_comes_back_gets_what_it_missed() {
 }
 
 #[test]
+fn big_events_are_kept_within_their_bytes() {
+    let hub = hub();
+    let write = |n: u64, mb: usize| {
+        let call = Call::new(&format!("t{n}"), "Write", json!({ "file_path": "Z:\\p\\a.md", "content": "x".repeat(mb * 1024 * 1024) }));
+        hub.publish(&ev(Agent::Claude, "a", Some("Z:\\p"), Kind::ToolStart { call }), 2_000 + n)
+    };
+    for n in 1..=4 {
+        write(n, 3);
+    }
+    // The newest that fit in KEPT_BYTES kept; those before told as lost.
+    let got = drain(&mut hub.events("since=0", None));
+    assert_eq!(got.iter().map(|(e, d)| (e.as_str(), d["seq"].as_u64())).collect::<Vec<_>>(), [("reset", Some(4)), ("agent", Some(3)), ("agent", Some(4))]);
+    // One bigger than all of it is kept still, alone.
+    write(5, 9);
+    assert_eq!(drain(&mut hub.events("since=4", None)).iter().map(|(e, _)| e.as_str()).collect::<Vec<_>>(), ["agent"]);
+}
+
+#[test]
 fn a_client_that_reads_nothing_is_let_go() {
     let hub = hub();
     let slow = hub.events("", None);

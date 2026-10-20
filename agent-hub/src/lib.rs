@@ -13,9 +13,10 @@
 //   GET /v1/events     Server-Sent Events: each AgentEvent with its number
 //                      (id: and "seq") and time ("at"); ?since=<n> (or a
 //                      Last-Event-ID) sends those after n first, from the
-//                      last KEPT; when some were lost (too old, or the hub
-//                      started again since: its numbers began anew), an
-//                      event "reset" first, to read /v1/sessions again;
+//                      last KEPT (KEPT_BYTES at most); when some were lost
+//                      (too old, or the hub started again since: its
+//                      numbers began anew), an event "reset" first, to read
+//                      /v1/sessions again;
 //                      an event "sessions" when work that never said it
 //                      ended was given up, or quiet sessions forgotten
 //                      (tick), to read it again too; the same ?cwd= and
@@ -35,7 +36,7 @@ use std::hash::{BuildHasher, Hasher};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agent_core::event::{Agent, AgentEvent};
@@ -46,8 +47,11 @@ use serde_json::{json, Value};
 pub const API: u32 = 1;
 // What /v1 tells (a client looks here before asking).
 pub const CAPABILITIES: [&str; 2] = ["sessions", "events"];
-// The events kept for a client that comes back (?since=).
+// The events kept for a client that comes back (?since=), and their bytes at
+// most: an event may carry a whole file (a Write's content), and they are
+// kept whether anybody listens or not.
 const KEPT: usize = 512;
+const KEPT_BYTES: usize = 8 * 1024 * 1024;
 // The events a subscriber may leave unread before it is let go.
 const ROOM: usize = 256;
 // How often an idle stream says it is there (and finds a client gone).
@@ -122,23 +126,25 @@ fn decode(text: &str) -> String {
 }
 
 // An event as sent: its number, its folder (the session's, where the event
-// gave none) for the filters, and its lines on the stream.
+// gave none) for the filters, and its lines on the stream (one copy, shared
+// by the kept and every subscriber's queue).
 struct Record {
     seq: u64,
     agent: Agent,
     cwd: Option<String>,
-    chunk: String,
+    chunk: Arc<str>,
 }
 
 struct Subscriber {
     filter: Filter,
-    tx: SyncSender<String>,
+    tx: SyncSender<Arc<str>>,
 }
 
 struct State {
     registry: SessionRegistry,
     seq: u64,
     kept: VecDeque<Record>,
+    kept_bytes: usize,
     subscribers: Vec<Subscriber>,
 }
 
@@ -173,7 +179,7 @@ impl Hub {
     }
 
     pub fn with_token(token: String, token_file: PathBuf, now: u64) -> Hub {
-        Hub { token, token_file, boot: now, state: Mutex::new(State { registry: SessionRegistry::default(), seq: 0, kept: VecDeque::new(), subscribers: Vec::new() }) }
+        Hub { token, token_file, boot: now, state: Mutex::new(State { registry: SessionRegistry::default(), seq: 0, kept: VecDeque::new(), kept_bytes: 0, subscribers: Vec::new() }) }
     }
 
     pub fn token_file(&self) -> &Path {
@@ -202,12 +208,15 @@ impl Hub {
         if let Some(cwd) = &cwd {
             sent["cwd"] = json!(cwd);
         }
-        let chunk = format!("id: {seq}\nevent: agent\ndata: {sent}\n\n");
+        let chunk: Arc<str> = format!("id: {seq}\nevent: agent\ndata: {sent}\n\n").into();
         // A subscriber gone, or one that let ROOM go unread, is let go.
         st.subscribers.retain(|s| !s.filter.admits(event.agent, cwd.as_deref()) || s.tx.try_send(chunk.clone()).is_ok());
+        st.kept_bytes += chunk.len();
         st.kept.push_back(Record { seq, agent: event.agent, cwd, chunk });
-        if st.kept.len() > KEPT {
-            st.kept.pop_front();
+        while st.kept.len() > 1 && (st.kept.len() > KEPT || st.kept_bytes > KEPT_BYTES) {
+            if let Some(gone) = st.kept.pop_front() {
+                st.kept_bytes -= gone.chunk.len();
+            }
         }
         seq
     }
@@ -219,7 +228,7 @@ impl Hub {
         if !st.registry.check_stale(now) {
             return false;
         }
-        let chunk = format!("event: sessions\ndata: {}\n\n", json!({ "seq": st.seq }));
+        let chunk: Arc<str> = format!("event: sessions\ndata: {}\n\n", json!({ "seq": st.seq })).into();
         st.subscribers.retain(|s| s.tx.try_send(chunk.clone()).is_ok());
         true
     }
@@ -253,12 +262,12 @@ impl Hub {
         let filter = Filter::from_query(query);
         let since = pairs(query).into_iter().find(|(k, _)| k == "since").and_then(|(_, v)| v.parse::<u64>().ok()).or_else(|| last_event_id.and_then(|id| id.trim().parse().ok()));
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let mut first = Vec::new();
+        let mut first: Vec<Arc<str>> = Vec::new();
         if let Some(since) = since {
             let oldest = st.kept.front().map_or(st.seq + 1, |r| r.seq);
             // Numbers it never gave (another start of the hub's), or some no longer kept.
             if since > st.seq || since + 1 < oldest {
-                first.push(format!("event: reset\ndata: {}\n\n", json!({ "boot": self.boot, "seq": st.seq })));
+                first.push(format!("event: reset\ndata: {}\n\n", json!({ "boot": self.boot, "seq": st.seq })).into());
             }
             first.extend(st.kept.iter().filter(|r| r.seq > since && filter.admits(r.agent, r.cwd.as_deref())).map(|r| r.chunk.clone()));
         }
@@ -267,7 +276,7 @@ impl Hub {
             let _ = tx.try_send(chunk);
         }
         st.subscribers.push(Subscriber { filter, tx });
-        Events { rx, buf: Vec::new(), at: 0, ping: PING }
+        Events { rx, buf: Arc::from(""), at: 0, ping: PING }
     }
 
     // How many are listening (for her log).
@@ -280,8 +289,8 @@ impl Hub {
 // are none; its end when the hub lets it go. Read by whatever answers the
 // request (a chunked body, each read sent at once).
 pub struct Events {
-    rx: Receiver<String>,
-    buf: Vec<u8>,
+    rx: Receiver<Arc<str>>,
+    buf: Arc<str>,
     at: usize,
     ping: Duration,
 }
@@ -289,16 +298,16 @@ pub struct Events {
 impl Read for Events {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         if self.at >= self.buf.len() {
-            let chunk = match self.rx.recv_timeout(self.ping) {
+            self.buf = match self.rx.recv_timeout(self.ping) {
                 Ok(chunk) => chunk,
-                Err(RecvTimeoutError::Timeout) => ": ping\n\n".to_string(),
+                Err(RecvTimeoutError::Timeout) => Arc::from(": ping\n\n"),
                 Err(RecvTimeoutError::Disconnected) => return Ok(0),
             };
-            self.buf = chunk.into_bytes();
             self.at = 0;
         }
-        let n = out.len().min(self.buf.len() - self.at);
-        out[..n].copy_from_slice(&self.buf[self.at..self.at + n]);
+        let bytes = self.buf.as_bytes();
+        let n = out.len().min(bytes.len() - self.at);
+        out[..n].copy_from_slice(&bytes[self.at..self.at + n]);
         self.at += n;
         Ok(n)
     }
