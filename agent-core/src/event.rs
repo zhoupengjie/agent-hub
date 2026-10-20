@@ -2,9 +2,10 @@
 // agent's adapter (claude.rs, codex.rs, ...: to_event) makes of what the
 // agent sends, for an app to show its own way (Wakuwaku's moods and words)
 // and to keep (the sessions it knows). Serialized as an app would be sent
-// it: camelCase, each kind by its "type".
+// it: camelCase, each kind by its "type"; read back so (from_json: an app
+// may be given one, Wakuwaku's POST /state).
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 // Whose event: the agents she follows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -167,13 +168,27 @@ pub enum Wait {
         #[serde(rename = "answerIn")]
         answer_in: AnswerIn,
     },
-    Question,
+    // A question; where it may be answered and its words, where they are
+    // told (one an app handed back to the agent's own window).
+    Question {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        question: Option<String>,
+        #[serde(rename = "answerIn", skip_serializing_if = "Option::is_none")]
+        answer_in: Option<AnswerIn>,
+    },
     // A plan to confirm (ExitPlanMode).
     Plan,
     // An MCP server asks for input (Elicitation).
     Input { server: String },
     // Its attention, in its words or none.
     Notice { said: Option<String> },
+}
+
+impl Wait {
+    // A question, as an agent's hook tells it (no words, answered wherever).
+    pub fn question() -> Wait {
+        Wait::Question { question: None, answer_in: None }
+    }
 }
 
 // What an approval is for: a call, an action of the agent's own with no
@@ -208,4 +223,218 @@ pub enum Failure {
 // Text given, or None for none.
 pub(crate) fn given(text: &str) -> Option<String> {
     (!text.is_empty()).then(|| text.to_string())
+}
+
+// An event read back from its JSON as serialized above: what it leaves out
+// (or gives as null) taken as none, what it adds passed over (/v1/events'
+// seq and at). By hand, not by serde's Deserialize: that, for these tagged
+// kinds, came to some 110 KB in an exe that only reads them here.
+impl AgentEvent {
+    pub fn from_json(v: &Value) -> Result<AgentEvent, String> {
+        let o = fields(v, "an event")?;
+        let agent = text(o, "agent")?;
+        let agent = Agent::named(&agent).ok_or(format!("no agent {agent:?}"))?;
+        Ok(AgentEvent {
+            agent,
+            session: text(o, "session")?,
+            within: match o.get("within") {
+                None | Some(Value::Null) => false,
+                Some(within) => within.as_bool().ok_or("within: not true or false")?,
+            },
+            cwd: maybe(o, "cwd")?,
+            turn: maybe(o, "turn")?,
+            title: maybe(o, "title")?,
+            reply: maybe(o, "reply")?,
+            kind: Kind::from_json(o)?,
+        })
+    }
+}
+
+impl Agent {
+    // By its name as serialized ("claude" too, as from_tag has it not).
+    pub fn named(name: &str) -> Option<Agent> {
+        [Agent::Claude, Agent::Codex, Agent::Agy, Agent::Opencode, Agent::Omp, Agent::Zcode, Agent::Reasonix, Agent::Dsh].into_iter().find(|a| a.tag().unwrap_or("claude") == name)
+    }
+}
+
+impl Kind {
+    fn from_json(o: &Map<String, Value>) -> Result<Kind, String> {
+        Ok(match text(o, "type")?.as_str() {
+            "sessionStart" => Kind::SessionStart,
+            "sessionEnd" => Kind::SessionEnd,
+            "turnStart" => Kind::TurnStart { prompt: maybe(o, "prompt")? },
+            "toolStart" => Kind::ToolStart { call: Call::from_json(within(o, "call")?)? },
+            "toolDone" => Kind::ToolDone { call: Call::from_json(within(o, "call")?)? },
+            "toolFailed" => Kind::ToolFailed { call: Call::from_json(within(o, "call")?)?, quiet: o.get("quiet").and_then(Value::as_bool).unwrap_or(false) },
+            "waiting" => Kind::Waiting { wait: Wait::from_json(within(o, "wait")?)? },
+            "working" => Kind::Working,
+            "rest" => Kind::Rest,
+            "stopped" => Kind::Stopped,
+            "done" => Kind::Done,
+            "failed" => Kind::Failed { error: Failure::from_json(within(o, "error")?)? },
+            "taskDone" => Kind::TaskDone { subject: maybe(o, "subject")? },
+            other => return Err(format!("no type {other:?}")),
+        })
+    }
+}
+
+impl Call {
+    fn from_json(o: &Map<String, Value>) -> Result<Call, String> {
+        Ok(Call {
+            id: maybe(o, "id")?,
+            tool: text(o, "tool")?,
+            own: maybe(o, "own")?,
+            input: o.get("input").cloned().unwrap_or(Value::Null),
+            raw: o.get("raw").filter(|r| !r.is_null()).cloned(),
+            intent: maybe(o, "intent")?,
+            file: maybe(o, "file")?,
+            todo: match o.get("todo") {
+                None | Some(Value::Null) => None,
+                Some(todo) => Some(Todo::from_json(fields(todo, "todo")?)?),
+            },
+        })
+    }
+}
+
+impl Todo {
+    fn from_json(o: &Map<String, Value>) -> Result<Todo, String> {
+        let item = |v: &Value| -> Result<TodoItem, String> {
+            let o = fields(v, "an item")?;
+            let part = |key| Ok::<_, String>(maybe(o, key)?.unwrap_or_default());
+            Ok(TodoItem { text: part("text")?, active: part("active")?, status: part("status")? })
+        };
+        Ok(match text(o, "change")?.as_str() {
+            "set" => Todo::Set { items: o.get("items").and_then(Value::as_array).ok_or("items: not a list")?.iter().map(item).collect::<Result<_, _>>()? },
+            "add" => Todo::Add { item: item(o.get("item").unwrap_or(&Value::Null))? },
+            "update" => Todo::Update { id: text(o, "id")?, status: maybe(o, "status")?, text: maybe(o, "text")?, active: maybe(o, "active")? },
+            other => return Err(format!("no change {other:?}")),
+        })
+    }
+}
+
+impl Wait {
+    fn from_json(o: &Map<String, Value>) -> Result<Wait, String> {
+        Ok(match text(o, "for")?.as_str() {
+            "approval" => Wait::Approval { what: What::from_json(within(o, "what")?)?, answer_in: AnswerIn::from_json(within(o, "answerIn")?)? },
+            "question" => Wait::Question {
+                question: maybe(o, "question")?,
+                answer_in: match o.get("answerIn") {
+                    None | Some(Value::Null) => None,
+                    Some(answer_in) => Some(AnswerIn::from_json(fields(answer_in, "answerIn")?)?),
+                },
+            },
+            "plan" => Wait::Plan,
+            "input" => Wait::Input { server: text(o, "server")? },
+            "notice" => Wait::Notice { said: maybe(o, "said")? },
+            other => return Err(format!("no wait for {other:?}")),
+        })
+    }
+}
+
+impl What {
+    fn from_json(o: &Map<String, Value>) -> Result<What, String> {
+        Ok(match text(o, "as")?.as_str() {
+            "call" => What::Call { call: Call::from_json(within(o, "call")?)? },
+            "action" => What::Action { name: text(o, "name")? },
+            "said" => What::Said { said: text(o, "said")? },
+            other => return Err(format!("no what as {other:?}")),
+        })
+    }
+}
+
+impl AnswerIn {
+    fn from_json(o: &Map<String, Value>) -> Result<AnswerIn, String> {
+        Ok(match text(o, "in")?.as_str() {
+            "here" => AnswerIn::Here,
+            "app" => AnswerIn::App { name: text(o, "name")? },
+            "terminal" => AnswerIn::Terminal,
+            other => return Err(format!("no answer in {other:?}")),
+        })
+    }
+}
+
+impl Failure {
+    fn from_json(o: &Map<String, Value>) -> Result<Failure, String> {
+        Ok(match text(o, "as")?.as_str() {
+            "kind" => Failure::Kind { kind: text(o, "kind")? },
+            "said" => Failure::Said { said: text(o, "said")? },
+            other => return Err(format!("no failure as {other:?}")),
+        })
+    }
+}
+
+// An object's fields.
+fn fields<'a>(v: &'a Value, what: &str) -> Result<&'a Map<String, Value>, String> {
+    v.as_object().ok_or(format!("{what}: not an object"))
+}
+
+// The object a field holds.
+fn within<'a>(o: &'a Map<String, Value>, key: &str) -> Result<&'a Map<String, Value>, String> {
+    fields(o.get(key).ok_or(format!("no {key}"))?, key)
+}
+
+// A field's text, which must be there.
+fn text(o: &Map<String, Value>, key: &str) -> Result<String, String> {
+    maybe(o, key)?.ok_or(format!("no {key}"))
+}
+
+// A field's text, or none (left out, or null).
+fn maybe(o: &Map<String, Value>, key: &str) -> Result<Option<String>, String> {
+    match o.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(_) => Err(format!("{key}: not text")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // What is sent is read back the same, and what an event leaves out is none.
+    #[test]
+    fn an_event_is_read_back_as_it_was_sent() {
+        let call = Call {
+            raw: Some(json!({ "path": "a.md" })),
+            intent: Some("note it".into()),
+            file: Some("Z:/p/a.md".into()),
+            todo: Some(Todo::Update { id: "2".into(), status: Some("completed".into()), text: None, active: None }),
+            ..Call::new("t1", "Write", json!({ "file_path": "Z:/p/a.md", "content": "hi" }))
+        };
+        let base = AgentEvent { agent: Agent::Codex, session: "s".into(), within: true, cwd: Some("Z:/p".into()), turn: Some("u1".into()), title: Some("notes".into()), reply: Some("Done.".into()), kind: Kind::Working };
+        let kinds = [
+            Kind::SessionStart,
+            Kind::SessionEnd,
+            Kind::TurnStart { prompt: Some("write it".into()) },
+            Kind::TurnStart { prompt: None },
+            Kind::ToolStart { call: call.clone() },
+            Kind::ToolDone { call: call.clone() },
+            Kind::ToolFailed { call: Call::new("", "Bash", json!({})), quiet: true },
+            Kind::Waiting { wait: Wait::Approval { what: What::Call { call: call.clone() }, answer_in: AnswerIn::App { name: "DeepSeek Harness".into() } } },
+            Kind::Waiting { wait: Wait::Approval { what: What::Said { said: "rm".into() }, answer_in: AnswerIn::Terminal } },
+            Kind::Waiting { wait: Wait::question() },
+            Kind::Waiting { wait: Wait::Question { question: Some("Which?".into()), answer_in: Some(AnswerIn::Here) } },
+            Kind::Waiting { wait: Wait::Input { server: "github".into() } },
+            Kind::Waiting { wait: Wait::Notice { said: None } },
+            Kind::Rest,
+            Kind::Stopped,
+            Kind::Done,
+            Kind::Failed { error: Failure::Kind { kind: "rate_limit".into() } },
+            Kind::TaskDone { subject: Some("tests".into()) },
+        ];
+        for kind in kinds {
+            let ev = AgentEvent { kind, ..base.clone() };
+            let sent = serde_json::to_value(&ev).unwrap();
+            assert_eq!(AgentEvent::from_json(&sent), Ok(ev), "{sent}");
+        }
+        // A question as before: no words, nowhere said.
+        assert_eq!(serde_json::to_value(Wait::question()).unwrap(), json!({ "for": "question" }));
+        // The least there is; what /v1/events adds is passed over.
+        let ev = AgentEvent::from_json(&json!({ "agent": "claude", "session": "a", "type": "toolFailed", "call": { "tool": "Bash" }, "cwd": null, "seq": 3, "at": 9 })).unwrap();
+        assert_eq!(ev, AgentEvent { agent: Agent::Claude, session: "a".into(), within: false, cwd: None, turn: None, title: None, reply: None, kind: Kind::ToolFailed { call: Call { input: Value::Null, ..Call::new("", "Bash", Value::Null) }, quiet: false } });
+        for wrong in [json!({ "agent": "claude", "session": "a" }), json!({ "agent": "nobody", "session": "a", "type": "done" }), json!({ "session": "a", "type": "done" }), json!({ "agent": "claude", "session": "a", "type": "sleep" }), json!({ "agent": "claude", "session": 7, "type": "done" }), json!({ "agent": "claude", "session": "a", "type": "waiting", "wait": { "for": "approval", "what": { "as": "said", "said": "x" } } }), json!("done")] {
+            assert!(AgentEvent::from_json(&wrong).is_err(), "{wrong}");
+        }
+    }
 }

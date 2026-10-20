@@ -36,7 +36,7 @@ const ERROR_KINDS: [&str; 10] = [
 // What a tool that stops for the person waits on.
 pub fn asks_person(tool: &str) -> Option<Wait> {
     match tool {
-        "AskUserQuestion" => Some(Wait::Question),
+        "AskUserQuestion" => Some(Wait::question()),
         "ExitPlanMode" => Some(Wait::Plan),
         _ => None,
     }

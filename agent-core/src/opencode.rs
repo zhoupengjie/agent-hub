@@ -166,7 +166,7 @@ pub fn to_event(e: &Value) -> Option<AgentEvent> {
         "SessionEnd" => Kind::SessionEnd,
         "UserPromptSubmit" => Kind::TurnStart { prompt: given(s(e, "prompt")) },
         // OpenCode's question to the person waits on them like a prompt.
-        "PreToolUse" if tool == "question" => Kind::Waiting { wait: Wait::Question },
+        "PreToolUse" if tool == "question" => Kind::Waiting { wait: Wait::question() },
         "PreToolUse" => Kind::ToolStart { call: call() },
         "PostToolUse" => Kind::ToolDone { call: Call { file: edited(tool, &input), ..call() } },
         "PostToolUseFailure" => Kind::ToolFailed { call: call(), quiet: false },
@@ -179,7 +179,7 @@ pub fn to_event(e: &Value) -> Option<AgentEvent> {
             };
             Kind::Waiting { wait: Wait::Approval { what, answer_in: AnswerIn::Here } }
         }
-        "Question" => Kind::Waiting { wait: Wait::Question },
+        "Question" => Kind::Waiting { wait: Wait::question() },
         // Answered, here or there: back at work.
         "PermissionReplied" | "Answered" => Kind::Working,
         "Stop" => Kind::Done,

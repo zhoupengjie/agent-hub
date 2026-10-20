@@ -166,14 +166,28 @@ impl Session {
     }
 }
 
+// What an event did to its session (SessionRegistry::apply).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Applied {
+    // A session changed (or ended).
+    pub changed: bool,
+    // A subagent's with no turn of its session's under way: left out.
+    pub left_out: bool,
+    // From a turn already over: nothing but an edit counted (`changed` when
+    // it made its ending one that changed files).
+    pub late: bool,
+    // It began a turn.
+    pub began: bool,
+}
+
 #[derive(Default)]
 pub struct SessionRegistry {
     sessions: HashMap<String, Session>,
 }
 
 impl SessionRegistry {
-    // An event heard at `now`; true when a session changed.
-    pub fn apply(&mut self, ev: &AgentEvent, now: u64) -> bool {
+    // An event heard at `now`, and what it did.
+    pub fn apply(&mut self, ev: &AgentEvent, now: u64) -> Applied {
         let status = match &ev.kind {
             Kind::SessionStart | Kind::Rest | Kind::Stopped => Status::Idle,
             Kind::TurnStart { .. } | Kind::ToolStart { .. } | Kind::ToolDone { .. } | Kind::ToolFailed { .. } | Kind::Working => Status::Working,
@@ -182,14 +196,14 @@ impl SessionRegistry {
             Kind::Failed { error } => Status::Failed { error: error.clone() },
             Kind::SessionEnd => Status::Idle,
             // A task of its list done says nothing of where the session is.
-            Kind::TaskDone { .. } => return false,
+            Kind::TaskDone { .. } => return Applied::default(),
         };
         if ev.within && !self.sessions.get(&ev.session).is_some_and(Session::is_busy) {
-            return false;
+            return Applied { left_out: true, ..Applied::default() };
         }
         if ev.kind == Kind::SessionEnd {
             self.sessions.remove(&ev.session);
-            return true;
+            return Applied { changed: true, ..Applied::default() };
         }
         let s = self.sessions.entry(ev.session.clone()).or_insert_with(|| Session::new(&ev.session, ev.agent, now));
         if let Some(cwd) = &ev.cwd {
@@ -205,12 +219,14 @@ impl SessionRegistry {
         let turn = ev.turn.clone().unwrap_or_default();
         // Late, from a turn already over: only an edit counts, making its ending one that changed files.
         if !turn.is_empty() && s.ended_turns.contains(&turn) {
+            let mut changed = false;
             if is_edit {
                 if let Status::Done { edited } = &mut s.status {
+                    changed = !*edited;
                     *edited = true;
                 }
             }
-            return true;
+            return Applied { changed, late: true, ..Applied::default() };
         }
         s.event_at = now;
         if let Some(title) = &ev.title {
@@ -280,28 +296,44 @@ impl SessionRegistry {
             other => other,
         };
         s.set(status, now);
-        true
+        Applied { changed: true, began: starts, ..Applied::default() }
     }
 
     // Work that never said it ended given up, and sessions quiet too long
-    // forgotten; true when any changed.
-    pub fn check_stale(&mut self, now: u64) -> bool {
-        let before = self.sessions.len();
-        self.sessions.retain(|_, s| !(s.status == Status::Idle && now.saturating_sub(s.at) > FORGET_MS));
-        let mut changed = self.sessions.len() != before;
+    // forgotten: those that changed (forgotten ones no longer there).
+    pub fn check_stale(&mut self, now: u64) -> Vec<String> {
+        let mut changed: Vec<String> = Vec::new();
+        self.sessions.retain(|id, s| {
+            let keep = !(s.status == Status::Idle && now.saturating_sub(s.at) > FORGET_MS);
+            if !keep {
+                changed.push(id.clone());
+            }
+            keep
+        });
         for s in self.sessions.values_mut() {
             let age = now.saturating_sub(s.at);
             let is_ending = matches!(s.status, Status::Done { .. } | Status::Failed { .. });
             if (s.is_busy() && age > STALE_MS) || (is_ending && age > FORGET_MS) {
                 s.set(Status::Idle, now);
-                changed = true;
+                changed.push(s.id.clone());
             }
         }
         changed
     }
 
+    // A session the app forgets by its own rule (Wakuwaku: an ending she
+    // saw, quiet since).
+    pub fn forget(&mut self, id: &str) {
+        self.sessions.remove(id);
+    }
+
     pub fn get(&self, id: &str) -> Option<&Session> {
         self.sessions.get(id)
+    }
+
+    // Every session, in no order.
+    pub fn sessions(&self) -> impl Iterator<Item = &Session> {
+        self.sessions.values()
     }
 
     // Every session, the latest to change first.
@@ -347,16 +379,17 @@ mod tests {
     fn a_late_edit_after_its_turn_ended() {
         let mut r = SessionRegistry::default();
         let codex = |turn: &str, kind| AgentEvent { agent: Agent::Codex, turn: Some(turn.into()), ..ev("c", kind) };
-        r.apply(&codex("t1", Kind::TurnStart { prompt: None }), 1);
+        assert_eq!(r.apply(&codex("t1", Kind::TurnStart { prompt: None }), 1), Applied { changed: true, began: true, ..Applied::default() });
         r.apply(&codex("t1", Kind::Done), 2);
         assert_eq!(r.get("c").unwrap().status, Status::Done { edited: false });
         // A step after its turn ended changes nothing; an edit makes it one that changed files.
-        r.apply(&codex("t1", Kind::ToolStart { call: call("x", "Bash") }), 3);
+        assert_eq!(r.apply(&codex("t1", Kind::ToolStart { call: call("x", "Bash") }), 3), Applied { late: true, ..Applied::default() });
         assert_eq!(r.get("c").unwrap().status, Status::Done { edited: false });
-        r.apply(&codex("t1", Kind::ToolDone { call: call("y", "apply_patch") }), 4);
+        assert_eq!(r.apply(&codex("t1", Kind::ToolDone { call: call("y", "apply_patch") }), 4), Applied { changed: true, late: true, ..Applied::default() });
         assert_eq!(r.get("c").unwrap().status, Status::Done { edited: true });
+        assert!(!r.apply(&codex("t1", Kind::ToolDone { call: call("y", "apply_patch") }), 4).changed);
         // A turn heard first by a step starts anew.
-        r.apply(&codex("t2", Kind::ToolStart { call: call("z", "Bash") }), 5);
+        assert!(r.apply(&codex("t2", Kind::ToolStart { call: call("z", "Bash") }), 5).began);
         assert_eq!((r.get("c").unwrap().status.clone(), r.get("c").unwrap().turn.as_deref()), (Status::Working, Some("t2")));
     }
 
@@ -364,13 +397,13 @@ mod tests {
     fn a_subagent_s_steps_go_only_into_a_turn_under_way() {
         let mut r = SessionRegistry::default();
         let within = |kind| AgentEvent { within: true, ..ev("a", kind) };
-        assert!(!r.apply(&within(Kind::ToolDone { call: call("c1", "Write") }), 1));
+        assert!(r.apply(&within(Kind::ToolDone { call: call("c1", "Write") }), 1).left_out);
         assert!(r.get("a").is_none());
         r.apply(&ev("a", Kind::TurnStart { prompt: None }), 2);
-        assert!(r.apply(&within(Kind::ToolDone { call: Call { file: Some("n.md".into()), ..call("c1", "Write") } }), 3));
+        assert!(r.apply(&within(Kind::ToolDone { call: Call { file: Some("n.md".into()), ..call("c1", "Write") } }), 3).changed);
         r.apply(&ev("a", Kind::Done), 4);
         assert_eq!(r.get("a").unwrap().status, Status::Done { edited: true });
-        assert!(!r.apply(&within(Kind::Working), 5));
+        assert!(r.apply(&within(Kind::Working), 5).left_out);
     }
 
     #[test]
@@ -394,9 +427,11 @@ mod tests {
         let mut r = SessionRegistry::default();
         r.apply(&ev("a", Kind::Working), 0);
         r.apply(&ev("b", Kind::SessionStart), 0);
-        assert!(r.check_stale(STALE_MS + 1));
+        assert_eq!(r.check_stale(STALE_MS + 1), ["a"]);
         assert_eq!(r.get("a").unwrap().status, Status::Idle);
-        r.check_stale(FORGET_MS + 1);
+        assert_eq!(r.check_stale(FORGET_MS + 1), ["b"]);
         assert_eq!(r.list().len(), 1);
+        r.forget("a");
+        assert!(r.sessions().next().is_none());
     }
 }

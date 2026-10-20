@@ -112,7 +112,7 @@ fn notification(e: &Value, session: &str, now: u64) -> Option<Wait> {
     match s(e, "notificationType") {
         "permission_prompt" if was_asked(session, now) => None,
         "permission_prompt" => Some(Wait::Approval { what: What::Said { said: said.to_string() }, answer_in: AnswerIn::App { name: "Reasonix".into() } }),
-        "question_prompt" => Some(Wait::Question),
+        "question_prompt" => Some(Wait::question()),
         _ if said.is_empty() => Some(Wait::Notice { said: None }),
         _ => Some(Wait::Notice { said: Some(said.to_string()) }),
     }

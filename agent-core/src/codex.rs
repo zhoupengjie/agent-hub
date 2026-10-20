@@ -35,7 +35,7 @@ pub fn to_event(e: &Value) -> Option<AgentEvent> {
         "SessionEnd" => Kind::SessionEnd,
         "UserPromptSubmit" => Kind::TurnStart { prompt: given(s(e, "prompt")) },
         // Its question to the person waits on them like a prompt.
-        "PreToolUse" if tool == "request_user_input" => Kind::Waiting { wait: Wait::Question },
+        "PreToolUse" if tool == "request_user_input" => Kind::Waiting { wait: Wait::question() },
         "PreToolUse" => Kind::ToolStart { call: call() },
         "PostToolUse" => {
             let file = patched(s(&input, "command")).first().filter(|_| tool == "apply_patch").map(|f| f.to_string());

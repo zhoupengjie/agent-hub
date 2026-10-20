@@ -225,7 +225,7 @@ impl Hub {
     // subscriber told so (an event "sessions"). True when any was.
     pub fn tick(&self, now: u64) -> bool {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if !st.registry.check_stale(now) {
+        if st.registry.check_stale(now).is_empty() {
             return false;
         }
         let chunk: Arc<str> = format!("event: sessions\ndata: {}\n\n", json!({ "seq": st.seq })).into();
