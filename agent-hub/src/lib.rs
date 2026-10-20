@@ -1,0 +1,308 @@
+// What an app that follows the agents' sessions tells other local apps of
+// them (an editor, a script): which sessions there are, and each event as it
+// comes, through its own HTTP port (the app serves the requests; this crate
+// knows no HTTP server):
+//
+//   GET /v1/info       the hub: its API version, what it can tell, the app
+//                      it runs in, its start, its latest event's number,
+//                      where its token is (no token needed)
+//   GET /v1/sessions   the sessions known (agent-core's registry): ?cwd=<a
+//                      folder> (those working in it or under it), ?agent=
+//                      codex,dsh; with the latest event's number, so that
+//                      /v1/events?since= takes on from them with none lost
+//   GET /v1/events     Server-Sent Events: each AgentEvent with its number
+//                      (id: and "seq") and time ("at"); ?since=<n> (or a
+//                      Last-Event-ID) sends those after n first, from the
+//                      last KEPT; when some were lost (too old, or the hub
+//                      started again since: its numbers began anew), an
+//                      event "reset" first, to read /v1/sessions again;
+//                      an event "sessions" when work that never said it
+//                      ended was given up, or quiet sessions forgotten
+//                      (tick), to read it again too; the same ?cwd= and
+//                      ?agent=; ": ping" every 15 s
+//
+// /v1/sessions and /v1/events take the hub's token (Authorization: Bearer
+// <token>), kept in a file of the app's own folder (token_file): the events
+// carry what the person asked and the files' text an edit changed, and a web
+// page in a browser on this machine could otherwise ask for them.
+//
+// One app holds the hub at a time (the one on the port). A subscriber that
+// does not read keeps ROOM events waiting at most, then is let go: a slow
+// reader never holds up the agents' hooks.
+use std::collections::hash_map::RandomState;
+use std::collections::VecDeque;
+use std::hash::{BuildHasher, Hasher};
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
+use std::sync::Mutex;
+use std::time::Duration;
+
+use agent_core::event::{Agent, AgentEvent};
+use agent_core::registry::SessionRegistry;
+use serde_json::{json, Value};
+
+// The API's version: /v2 for a change that is not only something added.
+pub const API: u32 = 1;
+// What /v1 tells (a client looks here before asking).
+pub const CAPABILITIES: [&str; 2] = ["sessions", "events"];
+// The events kept for a client that comes back (?since=).
+const KEPT: usize = 512;
+// The events a subscriber may leave unread before it is let go.
+const ROOM: usize = 256;
+// How often an idle stream says it is there (and finds a client gone).
+const PING: Duration = Duration::from_secs(15);
+
+// Which sessions a client wants: those in a folder (or under it), of these agents.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Filter {
+    cwd: Option<String>,
+    agents: Vec<Agent>,
+}
+
+impl Filter {
+    // From a query string (cwd=…&agent=codex,dsh).
+    pub fn from_query(query: &str) -> Filter {
+        let mut filter = Filter::default();
+        for (key, value) in pairs(query) {
+            match key.as_str() {
+                "cwd" if !value.is_empty() => filter.cwd = Some(same_path(&value)),
+                "agent" => filter.agents.extend(value.split(',').filter(|a| !a.is_empty()).map(|a| Agent::from_tag((a != "claude").then_some(a)))),
+                _ => {}
+            }
+        }
+        filter
+    }
+
+    fn admits(&self, agent: Agent, cwd: Option<&str>) -> bool {
+        let in_folder = match (&self.cwd, cwd) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some(want), Some(cwd)) => {
+                let cwd = same_path(cwd);
+                cwd == *want || cwd.starts_with(&format!("{want}/"))
+            }
+        };
+        in_folder && (self.agents.is_empty() || self.agents.contains(&agent))
+    }
+}
+
+// A path as paths are compared: one kind of slash, none at the end, and on
+// Windows any case.
+fn same_path(path: &str) -> String {
+    let path = path.replace('\\', "/").trim_end_matches('/').to_string();
+    if cfg!(windows) { path.to_lowercase() } else { path }
+}
+
+// A query string's pairs, their values %-decoded.
+fn pairs(query: &str) -> Vec<(String, String)> {
+    query.split('&').filter(|p| !p.is_empty()).map(|p| p.split_once('=').unwrap_or((p, ""))).map(|(k, v)| (decode(k), decode(v))).collect()
+}
+
+fn decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let hex = |b: u8| (b as char).to_digit(16);
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => out.push(b' '),
+            b'%' if i + 2 < bytes.len() => match (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                (Some(high), Some(low)) => {
+                    out.push((high * 16 + low) as u8);
+                    i += 2;
+                }
+                _ => out.push(b'%'),
+            },
+            b => out.push(b),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+// An event as sent: its number, its folder (the session's, where the event
+// gave none) for the filters, and its lines on the stream.
+struct Record {
+    seq: u64,
+    agent: Agent,
+    cwd: Option<String>,
+    chunk: String,
+}
+
+struct Subscriber {
+    filter: Filter,
+    tx: SyncSender<String>,
+}
+
+struct State {
+    registry: SessionRegistry,
+    seq: u64,
+    kept: VecDeque<Record>,
+    subscribers: Vec<Subscriber>,
+}
+
+pub struct Hub {
+    token: String,
+    token_file: PathBuf,
+    // When it started (ms): a client that saw another start knows its numbers began anew.
+    boot: u64,
+    state: Mutex<State>,
+}
+
+// A new token: 128 bits from the system's randomness (std's RandomState
+// keys come from it, each instance's its own).
+pub fn new_token() -> String {
+    (0..2).map(|_| format!("{:016x}", RandomState::new().build_hasher().finish())).collect()
+}
+
+impl Hub {
+    // The hub, its token in `folder` (made, with the folder, when there is none).
+    pub fn open(folder: &Path, now: u64) -> io::Result<Hub> {
+        std::fs::create_dir_all(folder)?;
+        let token_file = folder.join("token");
+        let token = match std::fs::read_to_string(&token_file) {
+            Ok(text) if text.trim().len() >= 32 => text.trim().to_string(),
+            _ => {
+                let token = new_token();
+                std::fs::write(&token_file, &token)?;
+                token
+            }
+        };
+        Ok(Hub::with_token(token, token_file, now))
+    }
+
+    pub fn with_token(token: String, token_file: PathBuf, now: u64) -> Hub {
+        Hub { token, token_file, boot: now, state: Mutex::new(State { registry: SessionRegistry::default(), seq: 0, kept: VecDeque::new(), subscribers: Vec::new() }) }
+    }
+
+    pub fn token_file(&self) -> &Path {
+        &self.token_file
+    }
+
+    // Whether a request's Authorization header carries the token.
+    pub fn allows(&self, authorization: Option<&str>) -> bool {
+        let Some(given) = authorization.and_then(|a| a.trim().strip_prefix("Bearer ")) else { return false };
+        let given = given.trim().as_bytes();
+        // Every byte compared, whatever differs first.
+        given.len() == self.token.len() && given.iter().zip(self.token.as_bytes()).fold(0u8, |diff, (a, b)| diff | (a ^ b)) == 0
+    }
+
+    // An event heard at `now`: into the sessions, kept, and sent to each
+    // subscriber it is for. Its number.
+    pub fn publish(&self, event: &AgentEvent, now: u64) -> u64 {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.registry.apply(event, now);
+        let cwd = event.cwd.clone().or_else(|| st.registry.get(&event.session).and_then(|s| s.cwd.clone()));
+        st.seq += 1;
+        let seq = st.seq;
+        let mut sent = serde_json::to_value(event).unwrap_or(Value::Null);
+        sent["seq"] = json!(seq);
+        sent["at"] = json!(now);
+        if let Some(cwd) = &cwd {
+            sent["cwd"] = json!(cwd);
+        }
+        let chunk = format!("id: {seq}\nevent: agent\ndata: {sent}\n\n");
+        // A subscriber gone, or one that let ROOM go unread, is let go.
+        st.subscribers.retain(|s| !s.filter.admits(event.agent, cwd.as_deref()) || s.tx.try_send(chunk.clone()).is_ok());
+        st.kept.push_back(Record { seq, agent: event.agent, cwd, chunk });
+        if st.kept.len() > KEPT {
+            st.kept.pop_front();
+        }
+        seq
+    }
+
+    // Work that never said it ended given up, quiet sessions forgotten; each
+    // subscriber told so (an event "sessions"). True when any was.
+    pub fn tick(&self, now: u64) -> bool {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !st.registry.check_stale(now) {
+            return false;
+        }
+        let chunk = format!("event: sessions\ndata: {}\n\n", json!({ "seq": st.seq }));
+        st.subscribers.retain(|s| s.tx.try_send(chunk.clone()).is_ok());
+        true
+    }
+
+    // GET /v1/info, for the app `app` at `version`.
+    pub fn info(&self, app: &str, version: &str) -> Value {
+        let seq = self.state.lock().unwrap_or_else(|e| e.into_inner()).seq;
+        json!({
+            "api": API,
+            "hub": env!("CARGO_PKG_VERSION"),
+            "app": app,
+            "appVersion": version,
+            "boot": self.boot,
+            "seq": seq,
+            "capabilities": CAPABILITIES,
+            "token": { "header": "Authorization: Bearer <token>", "file": self.token_file },
+        })
+    }
+
+    // GET /v1/sessions?<query>.
+    pub fn sessions(&self, query: &str) -> Value {
+        let filter = Filter::from_query(query);
+        let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let sessions: Vec<Value> = st.registry.list().into_iter().filter(|s| filter.admits(s.agent, s.cwd.as_deref())).map(|s| serde_json::to_value(s).unwrap_or(Value::Null)).collect();
+        json!({ "boot": self.boot, "seq": st.seq, "sessions": sessions })
+    }
+
+    // GET /v1/events?<query>: the stream to answer with (its body), from
+    // ?since=, else a Last-Event-ID, else from now on.
+    pub fn events(&self, query: &str, last_event_id: Option<&str>) -> Events {
+        let filter = Filter::from_query(query);
+        let since = pairs(query).into_iter().find(|(k, _)| k == "since").and_then(|(_, v)| v.parse::<u64>().ok()).or_else(|| last_event_id.and_then(|id| id.trim().parse().ok()));
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut first = Vec::new();
+        if let Some(since) = since {
+            let oldest = st.kept.front().map_or(st.seq + 1, |r| r.seq);
+            // Numbers it never gave (another start of the hub's), or some no longer kept.
+            if since > st.seq || since + 1 < oldest {
+                first.push(format!("event: reset\ndata: {}\n\n", json!({ "boot": self.boot, "seq": st.seq })));
+            }
+            first.extend(st.kept.iter().filter(|r| r.seq > since && filter.admits(r.agent, r.cwd.as_deref())).map(|r| r.chunk.clone()));
+        }
+        let (tx, rx) = sync_channel(first.len() + ROOM);
+        for chunk in first {
+            let _ = tx.try_send(chunk);
+        }
+        st.subscribers.push(Subscriber { filter, tx });
+        Events { rx, buf: Vec::new(), at: 0, ping: PING }
+    }
+
+    // How many are listening (for her log).
+    pub fn listening(&self) -> usize {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).subscribers.len()
+    }
+}
+
+// One client's stream: the events for it as they come, a ping while there
+// are none; its end when the hub lets it go. Read by whatever answers the
+// request (a chunked body, each read sent at once).
+pub struct Events {
+    rx: Receiver<String>,
+    buf: Vec<u8>,
+    at: usize,
+    ping: Duration,
+}
+
+impl Read for Events {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if self.at >= self.buf.len() {
+            let chunk = match self.rx.recv_timeout(self.ping) {
+                Ok(chunk) => chunk,
+                Err(RecvTimeoutError::Timeout) => ": ping\n\n".to_string(),
+                Err(RecvTimeoutError::Disconnected) => return Ok(0),
+            };
+            self.buf = chunk.into_bytes();
+            self.at = 0;
+        }
+        let n = out.len().min(self.buf.len() - self.at);
+        out[..n].copy_from_slice(&self.buf[self.at..self.at + n]);
+        self.at += n;
+        Ok(n)
+    }
+}
+
+#[cfg(test)]
+mod tests;
