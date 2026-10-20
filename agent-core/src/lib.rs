@@ -16,6 +16,8 @@
 //   dsh       DeepSeek Harness's events: its tools by Claude Code's names, a
 //             prompt as an app reads one, a session's name, log, last reply,
 //             lineage
+//   registry  the sessions known from their events: status, turn, calls
+//             running, to-do list, files changed, how it ended
 //   project   the project a folder belongs to
 //   text      clip, base
 use std::path::Path;
@@ -33,6 +35,7 @@ pub mod omp;
 pub mod opencode;
 pub mod project;
 pub mod reasonix;
+pub mod registry;
 pub mod text;
 
 // What reading an event may need besides the event: the time (Reasonix
