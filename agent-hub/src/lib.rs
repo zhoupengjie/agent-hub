@@ -4,19 +4,23 @@
 // knows no HTTP server):
 //
 //   GET /v1/info       the hub: its API version, what it can tell, the app
-//                      it runs in, its start, its latest event's number,
-//                      where its token is (no token needed)
+//                      it runs in, its start (boot), its latest event's
+//                      number, where its token is (no token needed)
 //   GET /v1/sessions   the sessions known (agent-core's registry): ?cwd=<a
 //                      folder> (those working in it or under it), ?agent=
-//                      codex,dsh; with the latest event's number, so that
-//                      /v1/events?since= takes on from them with none lost
+//                      codex,dsh (an agent it does not know passed over;
+//                      none known, an error); with the latest event's
+//                      number, so that /v1/events?since= takes on from them
+//                      with none lost
 //   GET /v1/events     Server-Sent Events: each AgentEvent with its number
-//                      (id: and "seq") and time ("at"); ?since=<n> (or a
+//                      ("seq"; its id: is boot:seq) and time ("at"), a
+//                      turn's end (done, stopped, failed) with the files the
+//                      turn changed ("files"); ?since=<n> or <boot:n> (or a
 //                      Last-Event-ID) sends those after n first, from the
 //                      last KEPT (KEPT_BYTES at most); when some were lost
 //                      (too old, or the hub started again since: its
-//                      numbers began anew), an event "reset" first, to read
-//                      /v1/sessions again;
+//                      numbers began anew, its boot another), an event
+//                      "reset" first, to read /v1/sessions again;
 //                      an event "sessions" when work that never said it
 //                      ended was given up, or quiet sessions forgotten
 //                      (tick), to read it again too; the same ?cwd= and
@@ -27,9 +31,12 @@
 // carry what the person asked and the files' text an edit changed, and a web
 // page in a browser on this machine could otherwise ask for them.
 //
-// One app holds the hub at a time (the one on the port). A subscriber that
-// does not read keeps ROOM events waiting at most, then is let go: a slow
-// reader never holds up the agents' hooks.
+// One app holds the hub at a time: the one on PORT (another that finds it
+// taken is a client of it). A client finds it there (or at AGENT_HUB_URL:
+// url()), asks /v1/info for the API and the token's file, reads the token,
+// then asks the rest; nothing is written anywhere else to find it by. A
+// subscriber that does not read keeps ROOM events waiting at most, then is
+// let go: a slow reader never holds up the agents' hooks.
 use std::collections::hash_map::RandomState;
 use std::collections::VecDeque;
 use std::hash::{BuildHasher, Hasher};
@@ -39,9 +46,19 @@ use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use agent_core::event::{Agent, AgentEvent};
+use agent_core::event::{Agent, AgentEvent, Kind};
 use agent_core::registry::SessionRegistry;
 use serde_json::{json, Value};
+
+// Where the hub is: this port of this machine's, unless a client is told
+// otherwise (URL_VAR, an environment variable: a test's, another port).
+pub const PORT: u16 = 47213;
+pub const URL_VAR: &str = "AGENT_HUB_URL";
+
+// The address a client asks the hub at.
+pub fn url() -> String {
+    std::env::var(URL_VAR).ok().map(|u| u.trim().trim_end_matches('/').to_string()).filter(|u| !u.is_empty()).unwrap_or_else(|| format!("http://127.0.0.1:{PORT}"))
+}
 
 // The API's version: /v2 for a change that is not only something added.
 pub const API: u32 = 1;
@@ -66,16 +83,30 @@ pub struct Filter {
 
 impl Filter {
     // From a query string (cwd=…&agent=codex,dsh).
-    pub fn from_query(query: &str) -> Filter {
+    // An agent it does not know is passed over (one a newer client knows,
+    // asked of an older hub); asked for none it knows, it is an error, not
+    // every agent's sessions.
+    pub fn from_query(query: &str) -> Result<Filter, String> {
         let mut filter = Filter::default();
+        let mut unknown = Vec::new();
         for (key, value) in pairs(query) {
             match key.as_str() {
                 "cwd" if !value.is_empty() => filter.cwd = Some(same_path(&value)),
-                "agent" => filter.agents.extend(value.split(',').filter(|a| !a.is_empty()).map(|a| Agent::from_tag((a != "claude").then_some(a)))),
+                "agent" => {
+                    for name in value.split(',').filter(|a| !a.is_empty()) {
+                        match Agent::named(name) {
+                            Some(agent) => filter.agents.push(agent),
+                            None => unknown.push(name.to_string()),
+                        }
+                    }
+                }
                 _ => {}
             }
         }
-        filter
+        if filter.agents.is_empty() && !unknown.is_empty() {
+            return Err(format!("no agent {} (claude, codex, agy, opencode, omp, zcode, reasonix, dsh)", unknown.join(", ")));
+        }
+        Ok(filter)
     }
 
     fn admits(&self, agent: Agent, cwd: Option<&str>) -> bool {
@@ -96,6 +127,15 @@ impl Filter {
 fn same_path(path: &str) -> String {
     let path = path.replace('\\', "/").trim_end_matches('/').to_string();
     if cfg!(windows) { path.to_lowercase() } else { path }
+}
+
+// Where a client takes on from: `seq`, or `boot:seq` (an event's id).
+fn position(text: &str) -> Option<(Option<u64>, u64)> {
+    let text = text.trim();
+    match text.split_once(':') {
+        Some((boot, seq)) => Some((Some(boot.parse().ok()?), seq.parse().ok()?)),
+        None => Some((None, text.parse().ok()?)),
+    }
 }
 
 // A query string's pairs, their values %-decoded.
@@ -208,7 +248,15 @@ impl Hub {
         if let Some(cwd) = &cwd {
             sent["cwd"] = json!(cwd);
         }
-        let chunk: Arc<str> = format!("id: {seq}\nevent: agent\ndata: {sent}\n\n").into();
+        // A turn's end with the files it changed (the session's).
+        if matches!(event.kind, Kind::Done | Kind::Stopped | Kind::Failed { .. }) {
+            if let Some(s) = st.registry.get(&event.session) {
+                sent["files"] = json!(s.files);
+            }
+        }
+        // Its id says this start of the hub's too (`boot:seq`): a client that
+        // comes back with it from another start is told so (events).
+        let chunk: Arc<str> = format!("id: {}:{seq}\nevent: agent\ndata: {sent}\n\n", self.boot).into();
         // A subscriber gone, or one that let ROOM go unread, is let go.
         st.subscribers.retain(|s| !s.filter.admits(event.agent, cwd.as_deref()) || s.tx.try_send(chunk.clone()).is_ok());
         st.kept_bytes += chunk.len();
@@ -249,34 +297,38 @@ impl Hub {
     }
 
     // GET /v1/sessions?<query>.
-    pub fn sessions(&self, query: &str) -> Value {
-        let filter = Filter::from_query(query);
+    pub fn sessions(&self, query: &str) -> Result<Value, String> {
+        let filter = Filter::from_query(query)?;
         let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let sessions: Vec<Value> = st.registry.list().into_iter().filter(|s| filter.admits(s.agent, s.cwd.as_deref())).map(|s| serde_json::to_value(s).unwrap_or(Value::Null)).collect();
-        json!({ "boot": self.boot, "seq": st.seq, "sessions": sessions })
+        Ok(json!({ "boot": self.boot, "seq": st.seq, "sessions": sessions }))
     }
 
     // GET /v1/events?<query>: the stream to answer with (its body), from
     // ?since=, else a Last-Event-ID, else from now on.
-    pub fn events(&self, query: &str, last_event_id: Option<&str>) -> Events {
-        let filter = Filter::from_query(query);
-        let since = pairs(query).into_iter().find(|(k, _)| k == "since").and_then(|(_, v)| v.parse::<u64>().ok()).or_else(|| last_event_id.and_then(|id| id.trim().parse().ok()));
+    pub fn events(&self, query: &str, last_event_id: Option<&str>) -> Result<Events, String> {
+        let filter = Filter::from_query(query)?;
+        let since = pairs(query).into_iter().find(|(k, _)| k == "since").and_then(|(_, v)| position(&v)).or_else(|| last_event_id.and_then(position));
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let mut first: Vec<Arc<str>> = Vec::new();
-        if let Some(since) = since {
+        if let Some((boot, since)) = since {
             let oldest = st.kept.front().map_or(st.seq + 1, |r| r.seq);
-            // Numbers it never gave (another start of the hub's), or some no longer kept.
-            if since > st.seq || since + 1 < oldest {
+            // Another start of the hub's (its numbers began anew), numbers it
+            // never gave, or some no longer kept.
+            let other_start = boot.is_some_and(|boot| boot != self.boot);
+            if other_start || since > st.seq || since + 1 < oldest {
                 first.push(format!("event: reset\ndata: {}\n\n", json!({ "boot": self.boot, "seq": st.seq })).into());
             }
-            first.extend(st.kept.iter().filter(|r| r.seq > since && filter.admits(r.agent, r.cwd.as_deref())).map(|r| r.chunk.clone()));
+            if !other_start {
+                first.extend(st.kept.iter().filter(|r| r.seq > since && filter.admits(r.agent, r.cwd.as_deref())).map(|r| r.chunk.clone()));
+            }
         }
         let (tx, rx) = sync_channel(first.len() + ROOM);
         for chunk in first {
             let _ = tx.try_send(chunk);
         }
         st.subscribers.push(Subscriber { filter, tx });
-        Events { rx, buf: Arc::from(""), at: 0, ping: PING }
+        Ok(Events { rx, buf: Arc::from(""), at: 0, ping: PING })
     }
 
     // How many are listening (for her log).

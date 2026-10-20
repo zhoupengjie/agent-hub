@@ -11,12 +11,22 @@ Supported: Claude Code, Codex, Antigravity (agy), OpenCode, oh-my-pi (omp), ZCod
 - **agent-core**: every agent's events read into one kind of `AgentEvent` (`event.rs`: whose, which session, what it is doing), each agent's quirks in its own module (`claude.rs`, `codex.rs`, ...). `registry.rs` keeps the sessions known from those events: status, turn, the calls running, the to-do list, the files the turn changed, how it ended, late events, subagents, work given up. `asks.rs` is the permission prompts and questions waiting on the person: what a panel shows, the reply each agent's hook takes for each choice, when one was answered in the agent's own window. No window, no port, no Tauri.
 - **agent-hub**: the sessions told to other apps on the machine (an editor, a script):
   - `GET /v1/info`: the API version, what it tells, the app it runs in, the latest event's number, where the token is (no token needed);
-  - `GET /v1/sessions`: the sessions known, by folder (`?cwd=`) or agent (`?agent=`);
-  - `GET /v1/events`: Server-Sent Events, each event numbered, sent as it comes; `?since=` or `Last-Event-ID` sends what was missed first.
+  - `GET /v1/sessions`: the sessions known, by folder (`?cwd=`) or agent (`?agent=`; a name it does not know is passed over, none it knows is a 400);
+  - `GET /v1/events`: Server-Sent Events, each event numbered (`seq`; its `id:` is `boot:seq`), sent as it comes; a turn's end (`done`, `stopped`, `failed`) with the files the turn changed (`files`); `?since=` or `Last-Event-ID` sends what was missed first, a `reset` first when the hub started again since.
 
   The last two take a local token (`Authorization: Bearer <token>`), kept in the host app's own data folder. It holds no HTTP server: the host app serves the requests with its own and hands them to it (each endpoint is described at the top of `agent-hub/src/lib.rs`).
 
 The hooks are installed and forwarded by the host app (Wakuwaku's way: its `docs/DEVELOPMENT.md`).
+
+## How a client finds the hub
+
+One hub on a machine at a time: the app that holds port `47213` (`agent_hub::PORT`); an app that finds it taken is a client. A client:
+
+1. asks `GET http://127.0.0.1:47213/v1/info` (or at `AGENT_HUB_URL` when that is set: a test, another port; `agent_hub::url()`) and checks `api` is 1. No answer, or one with no `api`: no hub.
+2. reads the token from the file `token.file` names;
+3. asks `/v1/sessions` and `/v1/events` with `Authorization: Bearer <token>`.
+
+Nothing is written anywhere else to find it by.
 
 ## Use
 

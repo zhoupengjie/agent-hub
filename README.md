@@ -11,12 +11,22 @@
 - **agent-core**：每家 agent 的事件读成同一种 `AgentEvent`（`event.rs`：哪家、哪个会话、在做什么），各家的怪癖在各自的模块里（`claude.rs`、`codex.rs`……）。`registry.rs` 从这些事件记下有哪些会话：状态、回合、正在跑的调用、待办、这一轮改过的文件、怎么结束的、迟到的事件、子代理、超时放弃。`asks.rs` 是等人回答的确认请求：面板要显示什么、每个选择回给各家 hook 什么、什么时候算在 agent 自己的窗口里答过。不带窗口、端口，不依赖 Tauri。
 - **agent-hub**：把会话告诉本机别的应用（编辑器、脚本）：
   - `GET /v1/info`：API 版本、能给什么、在哪个应用里、最新事件的编号、令牌文件在哪儿（不要令牌）；
-  - `GET /v1/sessions`：现在有哪些会话，可以按文件夹（`?cwd=`）、按 agent（`?agent=`）筛选；
-  - `GET /v1/events`：Server-Sent Events，每个事件带编号，一来就发；`?since=` 或 `Last-Event-ID` 补上漏掉的。
+  - `GET /v1/sessions`：现在有哪些会话，可以按文件夹（`?cwd=`）、按 agent（`?agent=`，不认识的名字跳过，一个都不认识时回 400）筛选；
+  - `GET /v1/events`：Server-Sent Events，每个事件带编号（`seq`；`id:` 是 `启动时间:编号`），一来就发；一轮结束（`done`、`stopped`、`failed`）时带上这一轮改过的文件（`files`）；`?since=` 或 `Last-Event-ID` 补上漏掉的，hub 重启过就先发 `reset`。
 
   后两个要带本机令牌（`Authorization: Bearer <令牌>`），令牌放在宿主应用自己的数据文件夹里。它不带 HTTP 服务器：宿主应用用自己的服务器接请求，交给它回答（每个接口的细节写在 `agent-hub/src/lib.rs` 开头）。
 
 hook 由宿主应用安装、转发（Wakuwaku 的做法见它的 `docs/DEVELOPMENT.md`）。
+
+## 客户端怎么找到 hub
+
+一台机器同一时间只有一个 hub：占着端口 `47213`（`agent_hub::PORT`）的那个应用；后起来的应用发现端口被占，就当客户端。客户端：
+
+1. 问 `GET http://127.0.0.1:47213/v1/info`（设了环境变量 `AGENT_HUB_URL` 就用它：测试、换端口时；`agent_hub::url()`），确认 `api` 是 1。没有回答，或回答里没有 `api`，就是没有 hub。
+2. 读 `token.file` 指的文件，得到令牌。
+3. 带着 `Authorization: Bearer <令牌>` 请求 `/v1/sessions`、`/v1/events`。
+
+不在别处写任何用来“发现”的文件。
 
 ## 用法
 
