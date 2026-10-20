@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 use crate::claude::{bare, to_event as claude_event, todo_of};
 use crate::event::{Agent, AgentEvent, AnswerIn, Kind, Wait};
@@ -119,6 +119,9 @@ fn event_of(e: &Value, home: &Path) -> Option<AgentEvent> {
     }
     let claude = Value::Object(claude);
     let mut event = claude_event(&claude, Agent::Dsh)?;
+    if let Some(tool) = e.get("tool_name").and_then(Value::as_str) {
+        keep_own(&mut event, tool, e.get("tool_input").unwrap_or(&Value::Null));
+    }
     // The to-do list as its tool ends: the one hook it has.
     if name == "PostToolUse" {
         if let Kind::ToolDone { call } | Kind::ToolFailed { call, .. } = &mut event.kind {
@@ -135,17 +138,53 @@ fn event_of(e: &Value, home: &Path) -> Option<AgentEvent> {
     }
     Some(event)
 }
-// A DSH tool and its input as Claude Code names them, for events.rs.
+// DSH's own name and input of an event's call, where Claude Code's differ.
+fn keep_own(event: &mut AgentEvent, tool: &str, input: &Value) {
+    let Some(call) = event.call_mut() else { return };
+    if call.tool != tool {
+        call.own = Some(tool.to_string());
+    }
+    if call.input != *input {
+        call.raw = Some(input.clone());
+    }
+}
+
+// A DSH tool and its input as Claude Code names them, for events.rs. Its
+// read, write and edit take Claude Code's own fields (file_path, offset,
+// limit, content, old_string, new_string, replace_all: as 0.2.1 defines
+// them); str_replace_editor Anthropic's editor's (path, old_str, new_str,
+// file_text, view_range). An edit's text and a read's lines kept: what an
+// app shows of where the agent is in a file (zhoupengjie/agent-hub#1).
 pub fn claude_named(tool: &str, input: &Value) -> (String, Value) {
-    let file = |key: &str| json!({ "file_path": s(input, key) });
+    // These fields of the input, under Claude Code's names: (DSH's, Claude Code's).
+    let fields = |pairs: &[(&str, &str)]| {
+        let mut out = Map::new();
+        for (theirs, ours) in pairs {
+            if let Some(v) = input.get(*theirs).filter(|v| !v.is_null()) {
+                out.insert((*ours).into(), v.clone());
+            }
+        }
+        out.entry("file_path").or_insert_with(|| json!(""));
+        Value::Object(out)
+    };
     match tool {
-        "read" | "read_image" => ("Read".into(), file("file_path")),
-        "write" => ("Write".into(), file("file_path")),
-        "edit" => ("Edit".into(), file("file_path")),
+        "read" | "read_image" => ("Read".into(), fields(&[("file_path", "file_path"), ("offset", "offset"), ("limit", "limit")])),
+        "write" => ("Write".into(), fields(&[("file_path", "file_path"), ("content", "content")])),
+        "edit" => ("Edit".into(), fields(&[("file_path", "file_path"), ("old_string", "old_string"), ("new_string", "new_string"), ("replace_all", "replace_all")])),
         "str_replace_editor" => match s(input, "command") {
-            "view" => ("Read".into(), file("path")),
-            "create" => ("Write".into(), file("path")),
-            _ => ("Edit".into(), file("path")),
+            "view" => {
+                let mut read = fields(&[("path", "file_path")]);
+                // Lines [first, last] (last -1: to the end) as offset and limit.
+                if let Some([first, last]) = input.get("view_range").and_then(Value::as_array).and_then(|r| r.iter().map(Value::as_i64).collect::<Option<Vec<_>>>()).as_deref() {
+                    read["offset"] = json!(first);
+                    if *last >= *first {
+                        read["limit"] = json!(last - first + 1);
+                    }
+                }
+                ("Read".into(), read)
+            }
+            "create" => ("Write".into(), fields(&[("path", "file_path"), ("file_text", "content")])),
+            _ => ("Edit".into(), fields(&[("path", "file_path"), ("old_str", "old_string"), ("new_str", "new_string")])),
         },
         "pwsh" | "bash" => ("Bash".into(), json!({ "command": s(input, "command"), "description": s(input, "description") })),
         "glob" => ("Glob".into(), input.clone()),
@@ -647,5 +686,30 @@ mod tests {
         assert_eq!(title_of(&home, "session-none"), None);
         assert_eq!(title_of(&home, "..\\..\\x"), None);
         let _ = std::fs::remove_dir_all(&home);
+    }
+}
+
+#[cfg(test)]
+mod named_tests {
+    use super::*;
+
+    // DSH's read, write and edit keep Claude Code's fields; its
+    // str_replace_editor's are named so; its own name and input kept
+    // (zhoupengjie/agent-hub#1).
+    #[test]
+    fn edits_and_reads_keep_where_they_are() {
+        let edit = json!({ "file_path": "C:/w/a.md", "old_string": "a", "new_string": "b", "replace_all": true, "sandbox_permissions": "x" });
+        assert_eq!(claude_named("edit", &edit), ("Edit".to_string(), json!({ "file_path": "C:/w/a.md", "old_string": "a", "new_string": "b", "replace_all": true })));
+        assert_eq!(claude_named("read", &json!({ "file_path": "C:/w/a.md", "offset": 5, "limit": 20 })).1, json!({ "file_path": "C:/w/a.md", "offset": 5, "limit": 20 }));
+        assert_eq!(claude_named("write", &json!({ "file_path": "C:/w/a.md", "content": "hi" })).1, json!({ "file_path": "C:/w/a.md", "content": "hi" }));
+        let editor = |input: Value| claude_named("str_replace_editor", &input);
+        assert_eq!(editor(json!({ "command": "str_replace", "path": "C:/w/a.md", "old_str": "a", "new_str": "b" })), ("Edit".to_string(), json!({ "file_path": "C:/w/a.md", "old_string": "a", "new_string": "b" })));
+        assert_eq!(editor(json!({ "command": "view", "path": "C:/w/a.md", "view_range": [10, 19] })), ("Read".to_string(), json!({ "file_path": "C:/w/a.md", "offset": 10, "limit": 10 })));
+        assert_eq!(editor(json!({ "command": "view", "path": "C:/w/a.md", "view_range": [10, -1] })).1, json!({ "file_path": "C:/w/a.md", "offset": 10 }));
+        assert_eq!(editor(json!({ "command": "create", "path": "C:/w/b.md", "file_text": "x" })), ("Write".to_string(), json!({ "file_path": "C:/w/b.md", "content": "x" })));
+        // The event keeps DSH's own.
+        let e = json!({ "hook_event_name": "PreToolUse", "session_id": "s", "cwd": "C:/w", "tool_name": "edit", "tool_input": edit, "tool_use_id": "c1" });
+        let Some(AgentEvent { kind: Kind::ToolStart { call }, .. }) = to_event(&e, Path::new("Z:/nowhere/.dsh")) else { panic!("no tool start") };
+        assert_eq!((call.tool.as_str(), call.own.as_deref(), call.raw.as_ref(), call.input["new_string"].as_str()), ("Edit", Some("edit"), Some(&edit), Some("b")));
     }
 }

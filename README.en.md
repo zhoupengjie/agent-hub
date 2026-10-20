@@ -55,7 +55,7 @@ As JSON, camelCase, its kind in `type`; `AgentEvent::from_json` reads one back:
   "call": { "id": "toolu_…", "tool": "Bash", "input": { "command": "npm test" } } }
 ```
 
-`type` is one of `sessionStart`, `sessionEnd`, `turnStart`, `toolStart`, `toolDone`, `toolFailed`, `waiting`, `working`, `rest`, `stopped`, `done`, `failed`, `taskDone`; tools and their input go by Claude Code's names (the agent's own in `own` and `raw`). Every field is described in `agent-core/src/event.rs`.
+`type` is one of `sessionStart`, `sessionEnd`, `turnStart`, `toolStart`, `toolDone`, `toolFailed`, `waiting`, `working`, `rest`, `stopped`, `done`, `failed`, `taskDone`; tools and their input go by Claude Code's names (the agent's own in `own` and `raw`): an edit with its text (`old_string`, `new_string`, `replace_all`; several at once a `MultiEdit`'s `edits`), a read with its lines (`offset`, `limit`). A finished edit's file is its whole path, `call.file`, and every file a patch changed is in `call.files`. Where the host app's plugin cut an input short to keep an event small, `call.truncated` is `true`. Every field is described in `agent-core/src/event.rs`.
 
 ## Versions
 

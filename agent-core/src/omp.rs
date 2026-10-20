@@ -21,15 +21,56 @@ fn first<'a>(input: &'a Value, keys: &[&str]) -> &'a str {
     keys.iter().map(|k| s(input, k)).find(|v| !v.trim().is_empty()).unwrap_or("")
 }
 
+// The first of these arguments given, as it is (text or not).
+fn first_value(input: &Value, keys: &[&str]) -> Option<Value> {
+    keys.iter().find_map(|k| input.get(*k).filter(|v| !v.is_null()).cloned())
+}
+
+// One change of an omp edit, by Claude Code's names: its edit takes the
+// text to replace under any of several names (old_string, old_text,
+// oldText; as omp 18.11.1 reads them).
+fn change(input: &Value) -> serde_json::Map<String, Value> {
+    let mut out = serde_json::Map::new();
+    for (ours, theirs) in [("old_string", &["old_string", "old_text", "oldText", "old_str"][..]), ("new_string", &["new_string", "new_text", "newText", "new_str"][..]), ("replace_all", &["replace_all", "replaceAll"][..])] {
+        if let Some(v) = first_value(input, theirs) {
+            out.insert(ours.into(), v);
+        }
+    }
+    out
+}
+
+// An omp edit as Claude Code's: one change an Edit, a list of them
+// (`edits`) a MultiEdit.
+fn edit_of(input: &Value, path: &str) -> (&'static str, Value) {
+    match input.get("edits").and_then(Value::as_array) {
+        Some(edits) => ("MultiEdit", json!({ "file_path": path, "edits": edits.iter().map(|e| Value::Object(change(e))).collect::<Vec<_>>() })),
+        None => {
+            let mut out = change(input);
+            out.insert("file_path".into(), json!(path));
+            ("Edit", Value::Object(out))
+        }
+    }
+}
+
 // An omp tool by Claude Code's name, with the arguments Claude Code's tool
-// has, or None for one of its own (lsp, python, browser, eval, …).
+// has (an edit's text and a read's lines too: what an app shows of where
+// the agent is in a file, zhoupengjie/agent-hub#1), or None for one of its
+// own (lsp, python, browser, eval, …).
 pub fn as_claude(tool: &str, input: &Value, intent: &str) -> Option<(&'static str, Value)> {
     let path = || first(input, &["path", "file_path"]);
+    let with = |mut out: Value, keys: &[&str]| {
+        for key in keys {
+            if let Some(v) = input.get(*key).filter(|v| !v.is_null()) {
+                out[*key] = v.clone();
+            }
+        }
+        out
+    };
     Some(match tool {
         "bash" => ("Bash", json!({ "command": s(input, "command"), "description": intent })),
-        "read" => ("Read", json!({ "file_path": path() })),
-        "write" => ("Write", json!({ "file_path": path() })),
-        "edit" | "ast_edit" => ("Edit", json!({ "file_path": path() })),
+        "read" => ("Read", with(json!({ "file_path": path() }), &["offset", "limit"])),
+        "write" => ("Write", with(json!({ "file_path": path() }), &["content"])),
+        "edit" | "ast_edit" => edit_of(input, path()),
         "notebook" => ("NotebookEdit", json!({ "notebook_path": path() })),
         "grep" | "ast_grep" => ("Grep", json!({ "pattern": first(input, &["pattern", "query"]) })),
         // glob takes its pattern as `path` ("*.txt").
@@ -115,4 +156,26 @@ pub fn to_event(e: &Value) -> Option<AgentEvent> {
         event.title = Some(clip(&title, 80));
     }
     Some(event)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // An edit's text under any of the names omp takes it by, a list of them,
+    // a read's lines, by Claude Code's names (zhoupengjie/agent-hub#1).
+    #[test]
+    fn edits_and_reads_keep_where_they_are() {
+        let edit = |input: Value| as_claude("edit", &input, "").unwrap();
+        let want = json!({ "file_path": "a.txt", "old_string": "hi", "new_string": "bye" });
+        assert_eq!(edit(json!({ "path": "a.txt", "old_string": "hi", "new_string": "bye" })), ("Edit", want.clone()));
+        assert_eq!(edit(json!({ "path": "a.txt", "oldText": "hi", "newText": "bye" })), ("Edit", want.clone()));
+        assert_eq!(edit(json!({ "file_path": "a.txt", "old_text": "hi", "new_text": "bye" })), ("Edit", want));
+        assert_eq!(
+            edit(json!({ "path": "a.txt", "edits": [{ "oldText": "a", "newText": "b" }, { "old_string": "c", "new_string": "d", "replace_all": true }] })),
+            ("MultiEdit", json!({ "file_path": "a.txt", "edits": [{ "old_string": "a", "new_string": "b" }, { "old_string": "c", "new_string": "d", "replace_all": true }] }))
+        );
+        assert_eq!(as_claude("read", &json!({ "path": "a.txt", "offset": 3, "limit": 9 }), ""), Some(("Read", json!({ "file_path": "a.txt", "offset": 3, "limit": 9 }))));
+        assert_eq!(as_claude("write", &json!({ "path": "a.txt", "content": "x" }), ""), Some(("Write", json!({ "file_path": "a.txt", "content": "x" }))));
+    }
 }

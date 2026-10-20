@@ -11,6 +11,7 @@ use serde_json::Value;
 
 use crate::event::{given, Agent, AgentEvent, AnswerIn, Call, Kind, Wait, What};
 use crate::s;
+use crate::text::absolute;
 
 // The files a patch adds, changes or deletes.
 pub fn patched(patch: &str) -> Vec<&str> {
@@ -37,9 +38,10 @@ pub fn to_event(e: &Value) -> Option<AgentEvent> {
         // Its question to the person waits on them like a prompt.
         "PreToolUse" if tool == "request_user_input" => Kind::Waiting { wait: Wait::question() },
         "PreToolUse" => Kind::ToolStart { call: call() },
+        // Every file its patch changed, by its whole path.
         "PostToolUse" => {
-            let file = patched(s(&input, "command")).first().filter(|_| tool == "apply_patch").map(|f| f.to_string());
-            Kind::ToolDone { call: Call { file, ..call() } }
+            let files: Vec<String> = if tool == "apply_patch" { patched(s(&input, "command")).iter().map(|f| absolute(s(e, "cwd"), f)).collect() } else { Vec::new() };
+            Kind::ToolDone { call: Call { file: files.first().cloned(), files, ..call() } }
         }
         "PermissionRequest" => Kind::Waiting { wait: Wait::Approval { what: What::Call { call: call() }, answer_in: AnswerIn::Here } },
         "Stop" => Kind::Done,
@@ -68,5 +70,9 @@ mod tests {
         let patch = "*** Begin Patch\n*** Add File: hello.txt\n+hi\n*** Update File: D:\\w\\b.txt\n@@\n-a\n+b\n*** Delete File: old.txt\n*** End Patch";
         assert_eq!(patched(patch), ["hello.txt", "D:\\w\\b.txt", "old.txt"]);
         assert!(patched("not a patch").is_empty());
+        // A patch done: every file it changed, whole (zhoupengjie/agent-hub#2).
+        let done = serde_json::json!({ "hook_event_name": "PostToolUse", "session_id": "s", "cwd": "D:\\w", "tool_name": "apply_patch", "tool_input": { "command": patch } });
+        let Some(AgentEvent { kind: Kind::ToolDone { call }, .. }) = to_event(&done) else { panic!("no tool done") };
+        assert_eq!((call.file.as_deref(), call.files.as_slice()), (Some("D:\\w\\hello.txt"), &["D:\\w\\hello.txt".to_string(), "D:\\w\\b.txt".into(), "D:\\w\\old.txt".into()][..]));
     }
 }

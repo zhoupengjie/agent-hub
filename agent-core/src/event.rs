@@ -7,6 +7,17 @@
 use serde::Serialize;
 use serde_json::{Map, Value};
 
+impl AgentEvent {
+    // Its call, where it has one (a tool's, or one waiting for approval).
+    pub fn call_mut(&mut self) -> Option<&mut Call> {
+        match &mut self.kind {
+            Kind::ToolStart { call } | Kind::ToolDone { call } | Kind::ToolFailed { call, .. } => Some(call),
+            Kind::Waiting { wait: Wait::Approval { what: What::Call { call }, .. } } => Some(call),
+            _ => None,
+        }
+    }
+}
+
 // Whose event: the agents she follows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -126,17 +137,25 @@ pub struct Call {
     // The model's words for what it does (omp's intent, Antigravity's toolAction).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub intent: Option<String>,
-    // The file a finished edit changed.
+    // The file a finished edit changed (a patch's first), and every one a
+    // patch changed (Codex's apply_patch, OpenCode's patch); by their whole
+    // paths.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
     // A change it makes to the session's to-do list.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub todo: Option<Todo>,
+    // Its input was cut short before it came (the app's plugin in the agent
+    // keeps an event's size down): not all of it is here.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
 }
 
 impl Call {
     pub fn new(id: &str, tool: &str, input: Value) -> Call {
-        Call { id: (!id.is_empty()).then(|| id.to_string()), tool: tool.to_string(), own: None, input, raw: None, intent: None, file: None, todo: None }
+        Call { id: (!id.is_empty()).then(|| id.to_string()), tool: tool.to_string(), own: None, input, raw: None, intent: None, file: None, files: Vec::new(), todo: None, truncated: false }
     }
 }
 
@@ -288,10 +307,15 @@ impl Call {
             raw: o.get("raw").filter(|r| !r.is_null()).cloned(),
             intent: maybe(o, "intent")?,
             file: maybe(o, "file")?,
+            files: match o.get("files") {
+                None | Some(Value::Null) => Vec::new(),
+                Some(files) => files.as_array().ok_or("files: not a list")?.iter().map(|f| f.as_str().map(str::to_string).ok_or("files: not text")).collect::<Result<_, _>>()?,
+            },
             todo: match o.get("todo") {
                 None | Some(Value::Null) => None,
                 Some(todo) => Some(Todo::from_json(fields(todo, "todo")?)?),
             },
+            truncated: o.get("truncated").and_then(Value::as_bool).unwrap_or(false),
         })
     }
 }
@@ -399,6 +423,8 @@ mod tests {
             raw: Some(json!({ "path": "a.md" })),
             intent: Some("note it".into()),
             file: Some("Z:/p/a.md".into()),
+            files: vec!["Z:/p/a.md".into(), "Z:/p/b.md".into()],
+            truncated: true,
             todo: Some(Todo::Update { id: "2".into(), status: Some("completed".into()), text: None, active: None }),
             ..Call::new("t1", "Write", json!({ "file_path": "Z:/p/a.md", "content": "hi" }))
         };

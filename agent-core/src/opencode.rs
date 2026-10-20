@@ -28,16 +28,30 @@ use serde_json::{json, Map, Value};
 use crate::codex::patched;
 use crate::event::{given, Agent, AgentEvent, AnswerIn, Call, Failure, Kind, Wait, What};
 use crate::s;
-use crate::text::clip;
+use crate::text::{absolute, clip};
 
-// A tool as Claude Code names it, with its input as Claude Code's has it.
+// The fields an input has of these, under Claude Code's names: (OpenCode's, Claude Code's).
+fn renamed(input: &Value, fields: &[(&str, &str)]) -> Value {
+    let mut out = Map::new();
+    for (theirs, ours) in fields {
+        if let Some(v) = input.get(*theirs).filter(|v| !v.is_null()) {
+            out.insert((*ours).into(), v.clone());
+        }
+    }
+    out.entry("file_path").or_insert_with(|| json!(""));
+    Value::Object(out)
+}
+
+// A tool as Claude Code names it, with its input as Claude Code's has it
+// (an edit's text and a read's lines too: what an app shows of where the
+// agent is in a file, zhoupengjie/agent-hub#1).
 pub fn as_claude(tool: &str, input: &Value) -> (String, Value) {
     let i = |key: &str| json!(s(input, key));
     let (name, input) = match tool {
         "shell" => ("Bash", json!({ "command": i("command"), "description": i("description") })),
-        "read" => ("Read", json!({ "file_path": i("path") })),
-        "edit" => ("Edit", json!({ "file_path": i("path") })),
-        "write" => ("Write", json!({ "file_path": i("path") })),
+        "read" => ("Read", renamed(input, &[("path", "file_path"), ("offset", "offset"), ("limit", "limit")])),
+        "edit" => ("Edit", renamed(input, &[("path", "file_path"), ("oldString", "old_string"), ("newString", "new_string"), ("replaceAll", "replace_all")])),
+        "write" => ("Write", renamed(input, &[("path", "file_path"), ("content", "content")])),
         "patch" => ("apply_patch", json!({ "command": i("patchText") })),
         "glob" => ("Glob", json!({ "pattern": i("pattern") })),
         "grep" => ("Grep", json!({ "pattern": i("pattern") })),
@@ -115,14 +129,16 @@ pub fn normalize(e: &Value) -> Value {
     Value::Object(out)
 }
 
-// The file a finished edit changed.
-fn edited(tool: &str, input: &Value) -> Option<String> {
+// The files a finished edit changed, by their whole paths (a patch's, every one).
+fn edited(tool: &str, input: &Value, cwd: &str) -> Vec<String> {
     match tool {
-        "Edit" | "Write" => Some(s(input, "file_path").to_string()),
-        "apply_patch" => patched(s(input, "command")).first().map(|f| f.to_string()),
-        _ => None,
+        "Edit" | "Write" => vec![absolute(cwd, s(input, "file_path"))],
+        "apply_patch" => patched(s(input, "command")).iter().map(|f| absolute(cwd, f)).collect(),
+        _ => Vec::new(),
     }
+    .into_iter()
     .filter(|f| !f.is_empty())
+    .collect()
 }
 
 // Why a turn failed: one of Claude Code's kinds of error, or OpenCode's own words.
@@ -168,7 +184,12 @@ pub fn to_event(e: &Value) -> Option<AgentEvent> {
         // OpenCode's question to the person waits on them like a prompt.
         "PreToolUse" if tool == "question" => Kind::Waiting { wait: Wait::question() },
         "PreToolUse" => Kind::ToolStart { call: call() },
-        "PostToolUse" => Kind::ToolDone { call: Call { file: edited(tool, &input), ..call() } },
+        "PostToolUse" => {
+            let files = edited(tool, &input, s(e, "cwd"));
+            let file = files.first().cloned();
+            let files = if tool == "apply_patch" { files } else { Vec::new() };
+            Kind::ToolDone { call: Call { file, files, ..call() } }
+        }
         "PostToolUseFailure" => Kind::ToolFailed { call: call(), quiet: false },
         // The call it asks for, or for one of no call (a folder outside the
         // project), its action.
@@ -235,6 +256,10 @@ mod tests {
         }
         assert!(normalize(&event("session.execution.interrupted", json!({ "reason": "superseded" }))).is_null());
         assert_eq!(as_claude("patch", &json!({ "patchText": "x" })), ("apply_patch".to_string(), json!({ "command": "x" })));
+        // An edit's text and a read's lines, by Claude Code's names (zhoupengjie/agent-hub#1).
+        assert_eq!(as_claude("edit", &json!({ "path": "C:\\w\\a.md", "oldString": "a", "newString": "b", "replaceAll": true })).1, json!({ "file_path": "C:\\w\\a.md", "old_string": "a", "new_string": "b", "replace_all": true }));
+        assert_eq!(as_claude("read", &json!({ "path": "C:\\w\\a.md", "offset": 10, "limit": 5 })).1, json!({ "file_path": "C:\\w\\a.md", "offset": 10, "limit": 5 }));
+        assert_eq!(as_claude("write", &json!({})).1, json!({ "file_path": "" }));
         assert_eq!(as_claude("github_create_issue", &json!({ "a": 1 })), ("github_create_issue".to_string(), json!({ "a": 1 })));
     }
 }

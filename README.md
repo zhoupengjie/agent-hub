@@ -55,7 +55,7 @@ JSON 是 camelCase，事件的种类在 `type` 里；`AgentEvent::from_json` 读
   "call": { "id": "toolu_…", "tool": "Bash", "input": { "command": "npm test" } } }
 ```
 
-`type` 有 `sessionStart`、`sessionEnd`、`turnStart`、`toolStart`、`toolDone`、`toolFailed`、`waiting`、`working`、`rest`、`stopped`、`done`、`failed`、`taskDone`；工具名和参数一律按 Claude Code 的叫法（agent 自己的叫法在 `own`、`raw` 里）。每个字段的意思写在 `agent-core/src/event.rs`。
+`type` 有 `sessionStart`、`sessionEnd`、`turnStart`、`toolStart`、`toolDone`、`toolFailed`、`waiting`、`working`、`rest`、`stopped`、`done`、`failed`、`taskDone`；工具名和参数一律按 Claude Code 的叫法（agent 自己的叫法在 `own`、`raw` 里）：编辑带着改的内容（`old_string`、`new_string`、`replace_all`，几处一起改的是 `MultiEdit` 的 `edits`），读文件带着行（`offset`、`limit`）。改完的文件是整条路径：`call.file`，补丁改了几个文件都在 `call.files`。宿主应用的插件为了控制大小截断过输入时，`call.truncated` 是 `true`。每个字段的意思写在 `agent-core/src/event.rs`。
 
 ## 版本
 

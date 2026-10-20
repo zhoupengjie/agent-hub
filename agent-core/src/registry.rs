@@ -278,9 +278,12 @@ impl SessionRegistry {
         if is_edit {
             s.edited = true;
         }
-        if let Some(file) = call.and_then(|c| c.file.as_ref()) {
-            if !s.files.contains(file) && s.files.len() < MAX_KEPT {
-                s.files.push(file.clone());
+        // Every file it changed (a patch's all).
+        if let Some(call) = call {
+            for file in call.files.iter().chain(call.file.iter()) {
+                if !s.files.contains(file) && s.files.len() < MAX_KEPT {
+                    s.files.push(file.clone());
+                }
             }
         }
         if let Some(todo) = call.and_then(|c| c.todo.as_ref()) {
