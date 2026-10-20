@@ -1,0 +1,64 @@
+# agent-hub
+
+[English](README.en.md)
+
+跟踪 coding agent 会话的两个 Rust crate：从 agent 的 hook 事件（和它留下的会话记录、会话日志）读出“这个会话在做什么”，再告诉本机别的应用。[Wakuwaku](https://github.com/zhoupengjie/Wakuwaku)（跟着 agent 干活的桌面宠物和任务栏）用的就是它们。
+
+支持：Claude Code、Codex、Antigravity（agy）、OpenCode、oh-my-pi（omp）、ZCode、Reasonix、DeepSeek Harness。
+
+## 两个 crate
+
+- **agent-core**：每家 agent 的事件读成同一种 `AgentEvent`（`event.rs`：哪家、哪个会话、在做什么），各家的怪癖在各自的模块里（`claude.rs`、`codex.rs`……）。`registry.rs` 从这些事件记下有哪些会话：状态、回合、正在跑的调用、待办、这一轮改过的文件、怎么结束的、迟到的事件、子代理、超时放弃。`asks.rs` 是等人回答的确认请求：面板要显示什么、每个选择回给各家 hook 什么、什么时候算在 agent 自己的窗口里答过。不带窗口、端口，不依赖 Tauri。
+- **agent-hub**：把会话告诉本机别的应用（编辑器、脚本）：
+  - `GET /v1/info`：API 版本、能给什么、在哪个应用里、最新事件的编号、令牌文件在哪儿（不要令牌）；
+  - `GET /v1/sessions`：现在有哪些会话，可以按文件夹（`?cwd=`）、按 agent（`?agent=`）筛选；
+  - `GET /v1/events`：Server-Sent Events，每个事件带编号，一来就发；`?since=` 或 `Last-Event-ID` 补上漏掉的。
+
+  后两个要带本机令牌（`Authorization: Bearer <令牌>`），令牌放在宿主应用自己的数据文件夹里。它不带 HTTP 服务器：宿主应用用自己的服务器接请求，交给它回答（每个接口的细节写在 `agent-hub/src/lib.rs` 开头）。
+
+hook 由宿主应用安装、转发（Wakuwaku 的做法见它的 `docs/DEVELOPMENT.md`）。
+
+## 用法
+
+```toml
+[dependencies]
+agent-core = { git = "https://github.com/zhoupengjie/agent-hub", tag = "v0.1.0" }
+agent-hub = { git = "https://github.com/zhoupengjie/agent-hub", tag = "v0.1.0" }
+```
+
+```rust
+use agent_core::{event::Agent, Context};
+
+// 一个 hook 事件（JSON）读成 AgentEvent，记进会话，告诉订阅者。
+let ctx = Context { now, dsh_home: &dsh_home };
+if let Some(ev) = agent_core::read(Agent::Codex, &mut hook_event, &ctx) {
+    hub.publish(&ev, now);
+}
+```
+
+## AgentEvent
+
+JSON 是 camelCase，事件的种类在 `type` 里；`AgentEvent::from_json` 读回来：
+
+```json
+{ "agent": "claude", "session": "…", "cwd": "D:\\work\\notes", "type": "toolStart",
+  "call": { "id": "toolu_…", "tool": "Bash", "input": { "command": "npm test" } } }
+```
+
+`type` 有 `sessionStart`、`sessionEnd`、`turnStart`、`toolStart`、`toolDone`、`toolFailed`、`waiting`、`working`、`rest`、`stopped`、`done`、`failed`、`taskDone`；工具名和参数一律按 Claude Code 的叫法（agent 自己的叫法在 `own`、`raw` 里）。每个字段的意思写在 `agent-core/src/event.rs`。
+
+## 版本
+
+用 tag 发版（`vX.Y.Z`）。`/v1` 里只会加字段，不兼容的改动换成 `/v2`（`agent_hub::API`）；客户端先看 `/v1/info` 的 `capabilities`。
+
+## 测试
+
+```bash
+cargo test --workspace
+```
+
+现在只在 Windows 上测（路径在那里比较时不分大小写），以后加 macOS。
+
+## 许可
+
+MIT，见 [LICENSE](LICENSE)。

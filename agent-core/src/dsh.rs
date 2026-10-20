@@ -552,9 +552,9 @@ mod tests {
     // c96167f1 the CLI reading note.txt and writing copy.txt, one turn;
     // 6aa5a96d the desktop app, a question then a write it was refused, two
     // turns; b7df6078 a one-word answer.
-    const C96: &[u8] = include_bytes!("../../../../test/fixtures/dsh/session-c96167f1.v4.jsonl.zstd");
-    const A6A: &[u8] = include_bytes!("../../../../test/fixtures/dsh/session-6aa5a96d.v4.jsonl.zstd");
-    const B7D: &[u8] = include_bytes!("../../../../test/fixtures/dsh/session-b7df6078.v4.jsonl.zstd");
+    const C96: &[u8] = include_bytes!("../fixtures/dsh/session-c96167f1.v4.jsonl.zstd");
+    const A6A: &[u8] = include_bytes!("../fixtures/dsh/session-6aa5a96d.v4.jsonl.zstd");
+    const B7D: &[u8] = include_bytes!("../fixtures/dsh/session-b7df6078.v4.jsonl.zstd");
     const C96_REPLY: &str = "Done — note.txt contained `hi`, and copy.txt now has the same text.";
 
     // A log written into a folder of the test's own, by this name.

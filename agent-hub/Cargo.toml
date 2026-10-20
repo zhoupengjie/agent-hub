@@ -5,6 +5,7 @@ edition = "2021"
 license = "MIT"
 authors = ["Pengjie Zhou"]
 description = "What an app tells other local apps of the agents' sessions it follows: the sessions known, each event as it comes (Server-Sent Events, missed ones sent again), behind a local token."
+repository = "https://github.com/zhoupengjie/agent-hub"
 
 [dependencies]
 agent-core = { path = "../agent-core" }

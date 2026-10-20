@@ -5,9 +5,10 @@ edition = "2021"
 license = "MIT"
 authors = ["Pengjie Zhou"]
 description = "What a coding agent's session is doing, from its hooks' events and the files it leaves: Claude Code, Codex, Antigravity, OpenCode, oh-my-pi, ZCode, Reasonix, DeepSeek Harness."
+repository = "https://github.com/zhoupengjie/agent-hub"
 
 [dependencies]
-# An event as an app is sent it (event.rs); both already in the tree, under Tauri.
+# An event as an app is sent it (event.rs); a Tauri app has both already.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # DeepSeek Harness's session log read for its last reply (dsh.rs): a

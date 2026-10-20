@@ -1,0 +1,16 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+jobs:
+  test:
+    # Both apps that use these crates run on Windows now (paths are
+    # compared there without case); macOS to come.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test --workspace --locked

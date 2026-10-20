@@ -1,0 +1,2 @@
+# DeepSeek Harness session logs (zstd) the tests read: bytes as they are
+agent-core/fixtures/dsh/*.zstd binary
