@@ -1,10 +1,34 @@
-// OpenCode 2's events, as a plugin inside it sends them ({ type, sessionID,
-// ... }, with what only it knows put in: the folder, the session's title,
-// the person's words, a call's tool, the turn's last text), by the names
-// Claude Code's hooks have.
+// OpenCode 2's events as a session's doing. OpenCode has no command hooks:
+// a plugin of an app's runs in its background service and posts its events
+// as OpenCode gives them, { type, sessionID, ... }, with what only it knows
+// put in: the folder (directory), the session's title, the person's words
+// for a turn (prompt), a call's tool, the turn's last text. As OpenCode
+// 2.0.29 sends them (2026-10-15):
+//   session.created              a session (sub-agents' are not sent)
+//   session.execution.started    a turn begins (prompt: the person's words)
+//   session.tool.called          a tool starts: id, tool, input
+//   session.tool.success|failed  it ends (error: { type, message })
+//   permission.asked             it asks the person: id, action ("shell",
+//                                "edit", …), resources, save (what "always"
+//                                allows), source.id (the call); agentID for
+//                                a sub-agent's
+//   permission.replied           answered (requestID, reply), anywhere
+//   form.created|replied|cancelled  its question tool waits on the person
+//   session.execution.succeeded  the turn is done (text: its last words)
+//   session.execution.failed     it failed (error)
+//   session.execution.interrupted  stopped (reason: user, shutdown, …)
+//   session.deleted
+// normalize gives each the names Claude Code's hooks have (hook_event_name,
+// session_id, cwd, tool_name, tool_input, …), as the prompts and the look
+// for where a session runs read them; to_event reads one so normalized. A
+// tool by Claude Code's name for it (shell is Bash, edit Edit, patch
+// apply_patch).
 use serde_json::{json, Map, Value};
 
+use crate::codex::patched;
+use crate::event::{given, Agent, AgentEvent, AnswerIn, Call, Failure, Kind, Wait, What};
 use crate::s;
+use crate::text::clip;
 
 // A tool as Claude Code names it, with its input as Claude Code's has it.
 pub fn as_claude(tool: &str, input: &Value) -> (String, Value) {
@@ -89,6 +113,91 @@ pub fn normalize(e: &Value) -> Value {
         _ => {}
     }
     Value::Object(out)
+}
+
+// The file a finished edit changed.
+fn edited(tool: &str, input: &Value) -> Option<String> {
+    match tool {
+        "Edit" | "Write" => Some(s(input, "file_path").to_string()),
+        "apply_patch" => patched(s(input, "command")).first().map(|f| f.to_string()),
+        _ => None,
+    }
+    .filter(|f| !f.is_empty())
+}
+
+// Why a turn failed: one of Claude Code's kinds of error, or OpenCode's own words.
+fn failure_of(error: &Value) -> Failure {
+    let kind = match s(error, "type") {
+        "provider.auth" => "authentication_failed",
+        "provider.rate-limit" => "rate_limit",
+        "provider.quota" => "billing_error",
+        "provider.internal" => "server_error",
+        "provider.invalid-request" => "invalid_request",
+        "provider.unknown" | "provider.no-route" => "model_not_found",
+        _ => return Failure::Said { said: s(error, "message").to_string() },
+    };
+    Failure::Kind { kind: kind.to_string() }
+}
+
+// A call by Claude Code's name, with OpenCode's own name and input kept
+// where they differ.
+fn call_of(id: &str, own: &str, input: &Value) -> Call {
+    let (tool, claude) = as_claude(own, input);
+    let renamed = own != tool;
+    Call { own: given(own).filter(|_| renamed), raw: (claude != *input).then(|| input.clone()), ..Call::new(id, &tool, claude) }
+}
+
+// An OpenCode event (normalized) as a session's doing, or None for one that
+// changes nothing.
+pub fn to_event(e: &Value) -> Option<AgentEvent> {
+    if !e.is_object() {
+        return None;
+    }
+    let (name, tool) = (s(e, "hook_event_name"), s(e, "tool_name"));
+    let input = e.get("tool_input").cloned().unwrap_or(Value::Null);
+    let raw = e.get("input").cloned().unwrap_or_else(|| json!({}));
+    // A call by its normalized name and input, OpenCode's own kept.
+    let call = || {
+        let own = s(e, "tool");
+        Call { own: given(own).filter(|o| o != tool), raw: (raw != input).then(|| raw.clone()), ..Call::new(s(e, "tool_use_id"), tool, input.clone()) }
+    };
+    let kind = match name {
+        "SessionStart" => Kind::SessionStart,
+        "SessionEnd" => Kind::SessionEnd,
+        "UserPromptSubmit" => Kind::TurnStart { prompt: given(s(e, "prompt")) },
+        // OpenCode's question to the person waits on them like a prompt.
+        "PreToolUse" if tool == "question" => Kind::Waiting { wait: Wait::Question },
+        "PreToolUse" => Kind::ToolStart { call: call() },
+        "PostToolUse" => Kind::ToolDone { call: Call { file: edited(tool, &input), ..call() } },
+        "PostToolUseFailure" => Kind::ToolFailed { call: call(), quiet: false },
+        // The call it asks for, or for one of no call (a folder outside the
+        // project), its action.
+        "PermissionRequest" => {
+            let what = match s(e, "tool") {
+                "" => What::Action { name: tool.to_string() },
+                own => What::Call { call: call_of(s(e, "tool_use_id"), own, &raw) },
+            };
+            Kind::Waiting { wait: Wait::Approval { what, answer_in: AnswerIn::Here } }
+        }
+        "Question" => Kind::Waiting { wait: Wait::Question },
+        // Answered, here or there: back at work.
+        "PermissionReplied" | "Answered" => Kind::Working,
+        "Stop" => Kind::Done,
+        "StopFailure" => Kind::Failed { error: failure_of(e.get("error").unwrap_or(&Value::Null)) },
+        // Stopped by the person.
+        "Interrupt" => Kind::Stopped,
+        _ => return None,
+    };
+    Some(AgentEvent {
+        agent: Agent::Opencode,
+        session: s(e, "session_id").to_string(),
+        within: false,
+        cwd: given(s(e, "cwd")),
+        turn: None,
+        title: given(s(e, "session_title")).map(|t| clip(&t, 80)),
+        reply: given(s(e, "last_assistant_message")),
+        kind,
+    })
 }
 
 #[cfg(test)]

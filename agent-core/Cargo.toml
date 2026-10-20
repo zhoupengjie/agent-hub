@@ -7,6 +7,8 @@ authors = ["Pengjie Zhou"]
 description = "What a coding agent's session is doing, from its hooks' events and the files it leaves: Claude Code, Codex, Antigravity, OpenCode, oh-my-pi, ZCode, Reasonix, DeepSeek Harness."
 
 [dependencies]
+# An event as an app is sent it (event.rs); both already in the tree, under Tauri.
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # DeepSeek Harness's session log read for its last reply (dsh.rs): a
 # Zstandard decoder in plain Rust, nothing under it (no checksums: "hash"

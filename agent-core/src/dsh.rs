@@ -1,9 +1,35 @@
-// DeepSeek Harness: its tools by Claude Code's names, a prompt of its as
-// asks read one, and what its folder tells of a session (DSH_HOME, else
-// ~/.dsh): its name (the projection cache), its log and the turn's last
-// words in it, whose the session is (the person's, or a subagent's).
-// Undocumented, as DSH 0.2.0-rc.2 has them (2026-10-15): nothing when
-// anything reads otherwise.
+// DeepSeek Harness hook events as a session's doing: Claude Code's
+// (claude.rs), its tools named as Claude Code's (claude_named); and what its
+// folder tells of a session (DSH_HOME, else ~/.dsh): its name (the
+// projection cache), its log and the turn's last words in it, whose the
+// session is (the person's, or a subagent's). Undocumented, as DSH
+// 0.2.0-rc.2 has them (2026-10-15): nothing when anything reads otherwise.
+//
+// They come from a plugin of an app's inside DSH, in the words of Claude
+// Code's hooks as DSH's Claude Code hook bridge
+// (@deepseek-ai/dsh-hooks-claude-code) said them, which an app's program
+// may still hand on for a DSH running the bridge's rows. What there is, as
+// the bridge of the desktop app 0.2.0-rc.2 and its CLI sent it
+// (2026-10-15): session_id, cwd, hook_event_name and an empty
+// transcript_path; SessionStart with source, UserPromptSubmit with prompt,
+// PreToolUse and PostToolUse with tool_name, tool_input, tool_use_id (and
+// tool_response, as text: "Error: …" for one that failed, which gets no
+// event of its own), Stop with nothing more. The plugin sends every tool's
+// (the bridge, some 0.9 s a hook, only a few), and what only it sees: the
+// turn's last words (last_assistant_message: the bridge's are read from the
+// session log, zstd-compressed, last_reply), the session's name
+// (session_title: else from DSH's projection cache, title_of), whose the
+// session is (origin, parent_session, top_session: else from its log,
+// whose), whether a tool failed (is_error), and a turn that ended without
+// finishing (Stop with stop_reason "aborted" or "blocked": stopped, not
+// done; StopFailure for one that failed). Its approvals and questions come
+// as PermissionRequest (the plugin's version 2; never from the bridge):
+// told as Claude Code's (waiting, what for), answerable where the plugin
+// can take an app's answer (answerable; for_ask makes them an app's
+// prompts, each closed by its own PermissionReplied); else to be answered in
+// DSH (answered_in_dsh). PermissionReplied, what came of one, lets the
+// session work on. A subagent's session is told as any other's: it is no
+// session of the person's (whose).
 use std::collections::HashMap;
 use std::io::{BufRead, Read};
 use std::path::{Path, PathBuf};
@@ -12,8 +38,103 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+use crate::claude::{bare, to_event as claude_event, todo_of};
+use crate::event::{Agent, AgentEvent, AnswerIn, Kind, Wait};
 use crate::s;
 use crate::text::clip;
+
+// A DSH event as a session's doing, or None for one that changes nothing.
+pub fn to_event(e: &Value, home: &Path) -> Option<AgentEvent> {
+    if !e.is_object() || s(e, "hook_event_name") == LOADED {
+        return None;
+    }
+    match whose_of(e, home) {
+        Whose::Own => event_of(e, home),
+        Whose::Sub(top) => of_subagent(e, &top, home),
+    }
+}
+
+// A prompt of DSH's no app holds (the plugin cannot take an app's answer to
+// it, or the app is out of sight): to be answered in DSH's own window.
+pub fn answered_in_dsh(event: &mut AgentEvent) {
+    if let Kind::Waiting { wait: Wait::Approval { answer_in, .. } } = &mut event.kind {
+        *answer_in = AnswerIn::App { name: "DeepSeek Harness".into() };
+    }
+}
+
+// A subagent's event: its own start, turns and end take its line away; a
+// tool of its, but its to-do list, is the top session's, within a turn of
+// that one's.
+fn of_subagent(e: &Value, top: &str, home: &Path) -> Option<AgentEvent> {
+    if matches!(s(e, "hook_event_name"), "SessionStart" | "UserPromptSubmit" | "Stop" | "StopFailure") {
+        return Some(bare(Agent::Dsh, s(e, "session_id"), "", Kind::SessionEnd));
+    }
+    if top.is_empty() || s(e, "tool_name") == "todo_write" {
+        return None;
+    }
+    let mut theirs = e.clone();
+    theirs["session_id"] = json!(top);
+    // Its own name (made of its task) is not the session's it works for.
+    if let Some(fields) = theirs.as_object_mut() {
+        fields.remove("session_title");
+    }
+    let mut event = event_of(&theirs, home)?;
+    event.within = true;
+    Some(event)
+}
+
+// An event of a session of the person's.
+fn event_of(e: &Value, home: &Path) -> Option<AgentEvent> {
+    let name = s(e, "hook_event_name");
+    let mut claude = e.as_object()?.clone();
+    // A turn's end: its last words, as Claude Code gives them; read from its
+    // log when they did not come with it (the old bridge's).
+    if name == "Stop" && e.get("last_assistant_message").is_none() {
+        if let Some(reply) = session_log(home, s(e, "cwd"), s(e, "session_id")).and_then(|log| last_reply(&log)) {
+            claude.insert("last_assistant_message".into(), json!(reply));
+        }
+    }
+    // A prompt answered (in DSH or in an app) or withdrawn: the session
+    // works on, its tool's end or its turn's to come; only into a turn
+    // still under way (within), never waking one.
+    if name == "PermissionReplied" {
+        return Some(AgentEvent { within: true, ..bare(Agent::Dsh, s(e, "session_id"), "", Kind::Working) });
+    }
+    // A turn stopped by the person, or refused before it began: not done,
+    // nothing to say of it.
+    if name == "Stop" && matches!(s(e, "stop_reason"), "aborted" | "blocked") {
+        return Some(bare(Agent::Dsh, s(e, "session_id"), s(e, "cwd"), Kind::Rest));
+    }
+    // A tool that failed (an edit the person refused in DSH's own dialog
+    // too) still ends in PostToolUse, its result an error's words: a
+    // failure, which changed nothing.
+    let failed = e.get("is_error").and_then(Value::as_bool) == Some(true) || s(e, "tool_response").trim_start().starts_with("Error");
+    if name == "PostToolUse" && failed {
+        claude.insert("hook_event_name".into(), json!("PostToolUseFailure"));
+    }
+    if let Some(tool) = e.get("tool_name").and_then(Value::as_str) {
+        let (named, input) = claude_named(tool, e.get("tool_input").unwrap_or(&Value::Null));
+        claude.insert("tool_name".into(), json!(named));
+        claude.insert("tool_input".into(), input);
+    }
+    let claude = Value::Object(claude);
+    let mut event = claude_event(&claude, Agent::Dsh)?;
+    // The to-do list as its tool ends: the one hook it has.
+    if name == "PostToolUse" {
+        if let Kind::ToolDone { call } | Kind::ToolFailed { call, .. } = &mut event.kind {
+            if let Some(todo) = todo_of(s(&claude, "tool_name"), claude.get("tool_input").unwrap_or(&Value::Null)) {
+                call.todo = Some(todo);
+            }
+        }
+    }
+    // Its name, when it did not come with the event.
+    if matches!(name, "SessionStart" | "UserPromptSubmit" | "Stop") && s(e, "session_title").is_empty() {
+        if let Some(title) = title_of(home, s(e, "session_id")) {
+            event.title = Some(title);
+        }
+    }
+    Some(event)
+}
 // A DSH tool and its input as Claude Code names them, for events.rs.
 pub fn claude_named(tool: &str, input: &Value) -> (String, Value) {
     let file = |key: &str| json!({ "file_path": s(input, key) });

@@ -1,11 +1,122 @@
-// Reasonix's hook events (its hook package's Payload, 2.x and the Go 1.x
-// alike: event, sessionId, cwd, toolName and toolArgs, toolResult, prompt
-// and turn, lastAssistantText, error, isInterrupt, source, reason, message
-// and notificationType) read as Claude Code's, by the table Reasonix itself
-// uses for the Claude Code hooks it runs; and whose a session is.
+// Reasonix hook events as a session's doing: read as Claude Code's
+// (claude.rs).
+//
+// Reasonix runs the hooks in its global settings.json, each as a command (an
+// app's own program with the event's name, which hands it to the app's
+// port). Its payload is its own (its hook package's Payload, 2.x and the Go
+// 1.x alike): event, sessionId, cwd (the workspace's root), toolName and
+// toolArgs (its tools' own names and arguments: write_file with path),
+// toolResult, prompt and turn, lastAssistantText, error, isInterrupt,
+// source, reason, message and notificationType; read as Claude Code's
+// fields and tools (the table Reasonix itself uses for the Claude Code hooks
+// it runs: as_claude). What differs, as its source has it (studio, 2.43,
+// 2026-10-17):
+//   - a failed turn fires StopFailure, then its settings' Stop hooks again
+//     with the same payload (error set): that Stop is no ending of its own;
+//     a failed tool, PostToolUseFailure and then PostToolUse the same way;
+//     the person stopping a turn is a StopFailure with isInterrupt;
+//   - SessionStart comes with the session's first turn, not as it opens;
+//   - its subagents (a task, explore, ...), its planner and its guardian
+//     fire the tool hooks under ids of their own, the session's with
+//     ":subagent:<ref>", ":planner" or ":guardian" after it: told as the
+//     session's steps while a turn of it is under way (within), never as a
+//     session of their own;
+//   - a PermissionRequest comes before its dialog, a Notification
+//     (permission_prompt) as the dialog shows: the first says what waits,
+//     the second only says it again (but for a plan's approval and Auto
+//     Guard's, which have no PermissionRequest); its questions (the ask
+//     tool) come as PreToolUse, then a Notification (question_prompt).
+// Its approvals are answered in Reasonix (its hook hands one on and is gone).
+use std::collections::HashMap;
+use std::sync::Mutex;
+
 use serde_json::{json, Map, Value};
 
+use crate::claude::{bare, to_event as claude_event};
+use crate::event::{Agent, AgentEvent, AnswerIn, Kind, Wait, What};
 use crate::s;
+
+// When each session last asked for an approval through PermissionRequest
+// (ms), so that its Notification for the same dialog, just after, changes
+// nothing: the first already said what waits.
+static ASKED: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
+// How long after a PermissionRequest its Notification is taken as the same
+// dialog's (it comes at once, in its own goroutine).
+pub const SAME_ASK_MS: u64 = 30_000;
+
+fn asked(session: &str, now: u64) {
+    let mut asked = ASKED.lock().unwrap_or_else(|e| e.into_inner());
+    let asked = asked.get_or_insert_with(HashMap::new);
+    asked.retain(|_, at| now.saturating_sub(*at) < SAME_ASK_MS);
+    asked.insert(session.to_string(), now);
+}
+
+fn was_asked(session: &str, now: u64) -> bool {
+    let asked = ASKED.lock().unwrap_or_else(|e| e.into_inner());
+    asked.as_ref().and_then(|a| a.get(session)).is_some_and(|at| now.saturating_sub(*at) < SAME_ASK_MS)
+}
+
+// A Reasonix event at `now` (which tells a Notification from the
+// PermissionRequest just before it) as a session's doing, or None for one
+// that changes nothing.
+pub fn to_event_at(e: &Value, now: u64) -> Option<AgentEvent> {
+    if !e.is_object() {
+        return None;
+    }
+    let (session, is_within) = whose(s(e, "sessionId"));
+    let failed = !s(e, "error").is_empty();
+    let is_interrupt = e.get("isInterrupt").and_then(Value::as_bool) == Some(true);
+    let claude = as_claude(e);
+    let own = |kind| bare(Agent::Reasonix, session, s(e, "cwd"), kind);
+    let mut event = match s(e, "event") {
+        // A prompt for its approval, answered in Reasonix.
+        "PermissionRequest" => {
+            let mut event = claude_event(&claude, Agent::Reasonix)?;
+            if let Kind::Waiting { wait: Wait::Approval { answer_in, .. } } = &mut event.kind {
+                *answer_in = AnswerIn::App { name: "Reasonix".into() };
+            }
+            asked(session, now);
+            event
+        }
+        "Notification" => own(Kind::Waiting { wait: notification(e, session, now)? }),
+        // A failed turn's or tool's, again as its plain end: told already.
+        "Stop" | "PostToolUse" if failed => return None,
+        // The person stopped the turn.
+        "StopFailure" if is_interrupt => own(Kind::Stopped),
+        // Its subagents' bounds and model calls, compactions: nothing.
+        "SubagentStart" | "SubagentStop" | "PostLLMCall" | "PreCompact" => return None,
+        _ => claude_event(&claude, Agent::Reasonix)?,
+    };
+    event.session = session.to_string();
+    if is_within {
+        // A subagent's step, as its session's; never a session, a turn or an
+        // ending of its own, nor a reaction or words of its own.
+        if !matches!(event.kind, Kind::ToolStart { .. } | Kind::ToolDone { .. } | Kind::ToolFailed { .. } | Kind::Waiting { .. } | Kind::Working) {
+            return None;
+        }
+        event.within = true;
+        event.reply = None;
+        if let Kind::ToolFailed { quiet, .. } = &mut event.kind {
+            *quiet = true;
+        }
+    }
+    Some(event)
+}
+
+// What it wants the person's attention for: an approval (said already by its
+// PermissionRequest, unless none came: a plan's, Auto Guard's), a question
+// (said already by the ask tool's start, and said the same again), or
+// something else, in its own words.
+fn notification(e: &Value, session: &str, now: u64) -> Option<Wait> {
+    let said = s(e, "message").trim();
+    match s(e, "notificationType") {
+        "permission_prompt" if was_asked(session, now) => None,
+        "permission_prompt" => Some(Wait::Approval { what: What::Said { said: said.to_string() }, answer_in: AnswerIn::App { name: "Reasonix".into() } }),
+        "question_prompt" => Some(Wait::Question),
+        _ if said.is_empty() => Some(Wait::Notice { said: None }),
+        _ => Some(Wait::Notice { said: Some(said.to_string()) }),
+    }
+}
 
 // Its tools as Claude Code names them (Reasonix's own table for the hooks it
 // imports from Claude Code: claudeToolNames in its hook package), each
