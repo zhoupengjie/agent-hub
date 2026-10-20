@@ -16,6 +16,8 @@
 //   dsh       DeepSeek Harness's events: its tools by Claude Code's names, a
 //             prompt as an app reads one, a session's name, log, last reply,
 //             lineage
+//   asks      the prompts waiting on the person: what each is, the hook's
+//             reply for each choice, when one is settled elsewhere
 //   registry  the sessions known from their events: status, turn, calls
 //             running, to-do list, files changed, how it ended
 //   project   the project a folder belongs to
@@ -27,6 +29,7 @@ use serde_json::Value;
 use event::{Agent, AgentEvent};
 
 pub mod agy;
+pub mod asks;
 pub mod claude;
 pub mod codex;
 pub mod dsh;
