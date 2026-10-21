@@ -220,9 +220,16 @@ fn is_token(text: &str) -> bool {
 // most, holding a token's form (zhoupengjie/agent-hub#4). Before anything
 // is opened the path alone is looked at (local_path): opening a network
 // path (\\host\share\…, WebDAV) would already send the person's sign-in to
-// it, and a pipe would be its server's to answer.
+// it, and a pipe would be its server's to answer. Then the folders above
+// it, one by one, none a link (no_linked_folder): a link to a network path
+// may be made by any account where Windows' developer mode is on.
+//
+// Left open: a folder looked at may be changed into a link before the file
+// is opened (by whoever chose the path, writing there). Closing that would
+// take opening each folder by its parent's handle, links not followed
+// (NtCreateFile, OBJ_DONT_REPARSE); not done.
 pub fn read_token(path: &Path) -> Option<String> {
-    if !local_path(path) || path.file_name()? != "token" {
+    if !local_path(path) || path.file_name()? != "token" || !no_linked_folder(path) {
         return None;
     }
     let mut options = std::fs::OpenOptions::new();
@@ -271,6 +278,30 @@ fn local_path(path: &Path) -> bool {
     {
         true
     }
+}
+
+// Whether every folder above a file, from the root down, is a plain folder:
+// none a link, nor a junction (Rust takes both for links). Each looked at
+// without following it (symlink_metadata), so the first link stops it
+// before anything is reached through it; a folder not there is a no
+// (zhoupengjie/agent-hub#4). A hub names its token's file by the path with
+// its links taken out (token_file_named), so that its own is never turned
+// away.
+fn no_linked_folder(path: &Path) -> bool {
+    use std::path::Component;
+    let Some(parent) = path.parent() else { return false };
+    let mut seen = PathBuf::new();
+    for part in parent.components() {
+        seen.push(part);
+        if matches!(part, Component::Prefix(_) | Component::RootDir) {
+            continue;
+        }
+        match std::fs::symlink_metadata(&seen) {
+            Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {}
+            _ => return false,
+        }
+    }
+    true
 }
 
 // What a hub that knows `token` answers a client's nonce with (/v1/info?
@@ -332,6 +363,13 @@ impl Hub {
 
     pub fn token_file(&self) -> &Path {
         &self.token_file
+    }
+
+    // The token's file as a client is told it (/v1/info): by its path with
+    // links and junctions taken out (\\?\C:\…), which a client's check
+    // (read_token: no linked folder) takes; as it is where that cannot be had.
+    pub fn token_file_named(&self) -> PathBuf {
+        std::fs::canonicalize(&self.token_file).unwrap_or_else(|_| self.token_file.clone())
     }
 
     // Whether a request's Authorization header carries the token.
@@ -404,7 +442,7 @@ impl Hub {
             "boot": self.boot,
             "seq": seq,
             "capabilities": CAPABILITIES,
-            "token": { "header": "Authorization: Bearer <token>", "file": self.token_file },
+            "token": { "header": "Authorization: Bearer <token>", "file": self.token_file_named() },
         });
         if let Some((_, nonce)) = pairs(query).into_iter().find(|(k, v)| k == "nonce" && !v.is_empty() && v.len() <= NONCE_MAX) {
             info["proof"] = json!(proof(&self.token, &nonce));

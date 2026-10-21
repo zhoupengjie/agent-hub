@@ -374,3 +374,66 @@ fn a_fifo_named_token_does_not_hang() {
     assert_eq!(read_token(&fifo), None);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// A folder of the token's path that is a junction (any account may make
+// one): not read through; the path with it taken out is (zhoupengjie/agent-hub#4).
+#[cfg(windows)]
+#[test]
+fn a_token_under_a_junction_is_not_read_through_it() {
+    let dir = std::env::temp_dir().join(format!("agent-hub-junction-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("real")).unwrap();
+    std::fs::write(dir.join("real").join("token"), "0123456789abcdef0123456789abcdef").unwrap();
+    let link = dir.join("link");
+    let made = std::process::Command::new("cmd").arg("/C").arg("mklink").arg("/J").arg(&link).arg(dir.join("real")).output().unwrap();
+    assert!(made.status.success(), "{made:?}");
+    assert!(!no_linked_folder(&link.join("token")));
+    assert_eq!(read_token(&link.join("token")), None);
+    let whole = std::fs::canonicalize(link.join("token")).unwrap();
+    assert!(no_linked_folder(&whole));
+    assert_eq!(read_token(&whole).as_deref(), Some("0123456789abcdef0123456789abcdef"));
+    // A folder not there.
+    assert!(!no_linked_folder(&dir.join("gone").join("token")));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// A folder of the token's path that is a link (Windows lets one be made
+// with an administrator's right or in developer mode; without it, skipped):
+// not read through.
+#[test]
+fn a_token_under_a_linked_folder_is_not_read_through_it() {
+    let dir = std::env::temp_dir().join(format!("agent-hub-linkdir-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("real")).unwrap();
+    std::fs::write(dir.join("real").join("token"), "0123456789abcdef0123456789abcdef").unwrap();
+    let link = dir.join("link");
+    #[cfg(windows)]
+    let made = std::os::windows::fs::symlink_dir(dir.join("real"), &link).is_ok();
+    #[cfg(unix)]
+    let made = std::os::unix::fs::symlink(dir.join("real"), &link).is_ok();
+    if made {
+        assert!(!no_linked_folder(&link.join("token")));
+        assert_eq!(read_token(&link.join("token")), None);
+    }
+    assert!(read_token(&dir.join("real").join("token")).is_some());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// A hub whose folder is reached through a junction tells its token's file
+// by the path with the junction taken out, which a client reads.
+#[cfg(windows)]
+#[test]
+fn a_hub_names_its_token_s_file_as_a_client_reads_it() {
+    let dir = std::env::temp_dir().join(format!("agent-hub-named-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("real")).unwrap();
+    let link = dir.join("link");
+    let made = std::process::Command::new("cmd").arg("/C").arg("mklink").arg("/J").arg(&link).arg(dir.join("real")).output().unwrap();
+    assert!(made.status.success(), "{made:?}");
+    let hub = Hub::open(&link.join("agent-hub"), 0).unwrap();
+    let named = hub.info_for("wakuwaku", "0.3.5", "")["token"]["file"].as_str().unwrap().to_string();
+    assert!(named.starts_with(r"\\?\") && !named.contains(r"\link\"), "{named}");
+    let token = read_token(Path::new(&named)).expect("its token, read");
+    assert!(hub.allows(Some(&format!("Bearer {token}"))));
+    let _ = std::fs::remove_dir_all(&dir);
+}
