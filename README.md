@@ -22,18 +22,19 @@ hook 由宿主应用安装、转发（Wakuwaku 的做法见它的 `docs/DEVELOPM
 
 一台机器同一时间只有一个 hub：占着端口 `47213`（`agent_hub::PORT`）的那个应用；后起来的应用发现端口被占，就当客户端。客户端：
 
-1. 问 `GET http://127.0.0.1:47213/v1/info`（设了环境变量 `AGENT_HUB_URL` 就用它：测试、换端口时；`agent_hub::url()`），确认 `api` 是 1。没有回答，或回答里没有 `api`，就是没有 hub。
-2. 读 `token.file` 指的文件，得到令牌。
-3. 带着 `Authorization: Bearer <令牌>` 请求 `/v1/sessions`、`/v1/events`。
+1. 生成一个随机的 nonce，问 `GET http://127.0.0.1:47213/v1/info?nonce=<nonce>`（设了环境变量 `AGENT_HUB_URL` 就用它：测试、换端口时；`agent_hub::url()`），确认 `api` 是 1、`capabilities` 里有 `proof`。没有回答，或回答里没有 `api`，就是没有 hub。
+2. 用 `agent_hub::read_token(token.file)` 读令牌：只认完整路径、文件名是 `token`、最多 64 字节、内容正好是 32 位小写十六进制的文件，否则当作没有 hub，什么都不发。
+3. 用 `agent_hub::proves(令牌, nonce, proof)` 核对回答里的 `proof`（令牌对 nonce 的 HMAC-SHA256），对不上就当作没有 hub。
+4. 带着 `Authorization: Bearer <令牌>` 请求 `/v1/sessions`、`/v1/events`。
 
-不在别处写任何用来“发现”的文件。
+第 2、3 步是因为 hub 没开时，本机别的程序（包括别的用户账号的）可能先占住这个端口、冒充 hub：它可以让客户端去读任意文件当令牌发给它，或者指向真的令牌文件骗走令牌。hub 发来的会话和事件也只当作要显示的数据，不照着它做任何事。不在别处写任何用来“发现”的文件。
 
 ## 用法
 
 ```toml
 [dependencies]
-agent-core = { git = "https://github.com/zhoupengjie/agent-hub", tag = "v0.1.0" }
-agent-hub = { git = "https://github.com/zhoupengjie/agent-hub", tag = "v0.1.0" }
+agent-core = { git = "https://github.com/zhoupengjie/agent-hub", tag = "v0.2.1" }
+agent-hub = { git = "https://github.com/zhoupengjie/agent-hub", tag = "v0.2.1" }
 ```
 
 ```rust

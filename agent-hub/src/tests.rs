@@ -151,7 +151,7 @@ fn the_sessions_known_and_where_to_take_on() {
     // A folder only begins with the one asked for: not one of its own.
     assert_eq!(hub.sessions("cwd=Z:\\replay\\we").unwrap()["sessions"].as_array().unwrap().len(), 0);
     let info = hub.info("wakuwaku", "0.3.4");
-    assert_eq!((info["api"].as_u64(), info["seq"].as_u64(), info["app"].as_str(), info["capabilities"].clone()), (Some(1), Some(2), Some("wakuwaku"), json!(["sessions", "events"])));
+    assert_eq!((info["api"].as_u64(), info["seq"].as_u64(), info["app"].as_str(), info["capabilities"].clone()), (Some(1), Some(2), Some("wakuwaku"), json!(["sessions", "events", "proof"])));
 }
 
 #[test]
@@ -242,4 +242,76 @@ fn queries_are_read_as_sent() {
     assert_eq!(decode("100%"), "100%");
     assert_eq!(decode("%zz"), "%zz");
     assert_eq!(Filter::from_query("agent=codex,claude&cwd=").unwrap().agents, [Agent::Codex, Agent::Claude]);
+}
+
+// HMAC-SHA256 as RFC 4231 has it (its test cases 1, 2 and 6: a key longer
+// than the block hashed first).
+#[test]
+fn hmac_is_as_the_rfc_has_it() {
+    let hex = |b: [u8; 32]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    assert_eq!(hex(hmac_sha256(&[0x0b; 20], b"Hi There")), "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7");
+    assert_eq!(hex(hmac_sha256(b"Jefe", b"what do ya want for nothing?")), "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
+    assert_eq!(hex(hmac_sha256(&[0xaa; 131], b"Test Using Larger Than Block-Size Key - Hash Key First")), "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54");
+}
+
+// A client reads only a token's file: whatever is on the port may name any
+// (zhoupengjie/agent-hub#4).
+#[test]
+fn a_client_reads_only_a_token() {
+    let dir = std::env::temp_dir().join(format!("agent-hub-read-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("keys")).unwrap();
+    let good = "0123456789abcdef0123456789abcdef";
+    let file = |name: &str, text: &str| {
+        let path = dir.join(name);
+        std::fs::write(&path, text).unwrap();
+        path
+    };
+    assert_eq!(read_token(&file("token", &format!("{good}\r\n"))).as_deref(), Some(good));
+    // Not named token, or a token's form in a file of another name.
+    assert_eq!(read_token(&file("id_ed25519", good)), None);
+    // Not a token's form: upper case, too short, too long, a key's text.
+    for text in [good.to_uppercase(), good[..31].to_string(), format!("{good}0"), "-----BEGIN OPENSSH PRIVATE KEY-----".into(), format!("{good}{}", " ".repeat(40))] {
+        assert_eq!(read_token(&file("token", &text)), None, "{text}");
+    }
+    // A relative path, a folder named token, none at all.
+    assert_eq!(read_token(Path::new("token")), None);
+    std::fs::create_dir_all(dir.join("keys").join("token")).unwrap();
+    assert_eq!(read_token(&dir.join("keys").join("token")), None);
+    assert_eq!(read_token(&dir.join("gone").join("token")), None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// A hub keeps a token of the form and makes anew one that is not, so that a
+// client's check never turns it away.
+#[test]
+fn a_hub_keeps_only_a_token() {
+    let dir = std::env::temp_dir().join(format!("agent-hub-keep-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let good = "0123456789abcdef0123456789abcdef";
+    std::fs::write(dir.join("token"), good).unwrap();
+    assert!(Hub::open(&dir, 0).unwrap().allows(Some(&format!("Bearer {good}"))));
+    std::fs::write(dir.join("token"), "Z".repeat(40)).unwrap();
+    let hub = Hub::open(&dir, 0).unwrap();
+    let made = read_token(&dir.join("token")).expect("a token made anew");
+    assert!(hub.allows(Some(&format!("Bearer {made}"))) && made != "Z".repeat(32));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// /v1/info?nonce= proves the hub knows its token; one that does not cannot.
+#[test]
+fn the_hub_proves_it_knows_the_token() {
+    let hub = hub();
+    let token = "t".repeat(32);
+    let info = hub.info_for("wakuwaku", "0.3.5", "nonce=r4nd0m%2Bn");
+    let given = info["proof"].as_str().unwrap();
+    assert!(proves(&token, "r4nd0m+n", given));
+    assert!(!proves(&"u".repeat(32), "r4nd0m+n", given));
+    assert!(!proves(&token, "another", given));
+    // None asked, an empty one, one too long: no proof.
+    for query in ["", "nonce=", &format!("nonce={}", "n".repeat(NONCE_MAX + 1))] {
+        assert!(hub.info_for("wakuwaku", "0.3.5", query).get("proof").is_none(), "{query}");
+    }
+    assert_eq!(hub.info("wakuwaku", "0.3.5")["hub"], env!("CARGO_PKG_VERSION"));
 }

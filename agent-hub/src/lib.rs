@@ -5,7 +5,8 @@
 //
 //   GET /v1/info       the hub: its API version, what it can tell, the app
 //                      it runs in, its start (boot), its latest event's
-//                      number, where its token is (no token needed)
+//                      number, where its token is (no token needed);
+//                      ?nonce=<n>: its proof that it knows the token
 //   GET /v1/sessions   the sessions known (agent-core's registry): ?cwd=<a
 //                      folder> (those working in it or under it), ?agent=
 //                      codex,dsh (an agent it does not know passed over;
@@ -33,8 +34,12 @@
 //
 // One app holds the hub at a time: the one on PORT (another that finds it
 // taken is a client of it). A client finds it there (or at AGENT_HUB_URL:
-// url()), asks /v1/info for the API and the token's file, reads the token,
-// then asks the rest; nothing is written anywhere else to find it by. A
+// url()), asks /v1/info?nonce=<a random one> for the API and the token's
+// file, reads the token (read_token: only a token's file), checks the
+// proof (proves), then asks the rest; nothing is written anywhere else to
+// find it by. Whatever else may hold the port while no hub does gets no
+// file of the person's and no token so. What the hub tells a client is
+// data to show, never what to do. A
 // subscriber that does not read keeps ROOM events waiting at most, then is
 // let go: a slow reader never holds up the agents' hooks.
 use std::collections::hash_map::RandomState;
@@ -63,7 +68,7 @@ pub fn url() -> String {
 // The API's version: /v2 for a change that is not only something added.
 pub const API: u32 = 1;
 // What /v1 tells (a client looks here before asking).
-pub const CAPABILITIES: [&str; 2] = ["sessions", "events"];
+pub const CAPABILITIES: [&str; 3] = ["sessions", "events", "proof"];
 // The events kept for a client that comes back (?since=), and their bytes at
 // most: an event may carry a whole file (a Write's content), and they are
 // kept whether anybody listens or not.
@@ -197,18 +202,76 @@ pub struct Hub {
 }
 
 // A new token: 128 bits from the system's randomness (std's RandomState
-// keys come from it, each instance's its own).
+// keys come from it, each instance's its own), as 32 lowercase hex digits.
 pub fn new_token() -> String {
     (0..2).map(|_| format!("{:016x}", RandomState::new().build_hasher().finish())).collect()
 }
+
+// Whether a text is a token's form: 32 lowercase hex digits, new_token's.
+fn is_token(text: &str) -> bool {
+    text.len() == 32 && text.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+// A hub's token as a client reads it, from the file /v1/info names
+// (token.file), or None: then it is no hub's, and the client sends nothing.
+// Whatever holds the port may name any file (one of the person's keys, for
+// the client to read and send it), so only a token's is read: a whole path
+// to a file named token, 64 bytes at most, holding a token's form
+// (zhoupengjie/agent-hub#4).
+pub fn read_token(path: &Path) -> Option<String> {
+    if !path.is_absolute() || path.file_name()? != "token" {
+        return None;
+    }
+    let mut text = String::new();
+    std::fs::File::open(path).ok()?.take(65).read_to_string(&mut text).ok()?;
+    let token = text.trim();
+    (text.len() <= 64 && is_token(token)).then(|| token.to_string())
+}
+
+// What a hub that knows `token` answers a client's nonce with (/v1/info?
+// nonce=: its proof): HMAC-SHA256 of the nonce under the token, as hex. A
+// client checks it (proves) before it sends the token: something else on
+// the port, naming the real token's file, cannot give it.
+pub fn proof(token: &str, nonce: &str) -> String {
+    hmac_sha256(token.as_bytes(), nonce.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+// Whether a hub's proof for a nonce shows it knows the token.
+pub fn proves(token: &str, nonce: &str, given: &str) -> bool {
+    same(proof(token, nonce).as_bytes(), given.trim().as_bytes())
+}
+
+// HMAC (RFC 2104) with SHA-256.
+fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut block = [0u8; 64];
+    if key.len() > block.len() {
+        block[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        block[..key.len()].copy_from_slice(key);
+    }
+    let pad = |byte: u8| block.map(|k| k ^ byte);
+    let inner = Sha256::new().chain_update(pad(0x36)).chain_update(message).finalize();
+    Sha256::new().chain_update(pad(0x5c)).chain_update(inner).finalize().into()
+}
+
+// Two byte strings the same, every byte compared, whatever differs first.
+fn same(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |diff, (x, y)| diff | (x ^ y)) == 0
+}
+
+// The nonces /v1/info proves its token with: up to this long.
+const NONCE_MAX: usize = 256;
 
 impl Hub {
     // The hub, its token in `folder` (made, with the folder, when there is none).
     pub fn open(folder: &Path, now: u64) -> io::Result<Hub> {
         std::fs::create_dir_all(folder)?;
         let token_file = folder.join("token");
+        // One of a token's form kept; anything else made anew, so that a
+        // client's check (read_token) never turns this hub away.
         let token = match std::fs::read_to_string(&token_file) {
-            Ok(text) if text.trim().len() >= 32 => text.trim().to_string(),
+            Ok(text) if text.len() <= 64 && is_token(text.trim()) => text.trim().to_string(),
             _ => {
                 let token = new_token();
                 std::fs::write(&token_file, &token)?;
@@ -229,9 +292,7 @@ impl Hub {
     // Whether a request's Authorization header carries the token.
     pub fn allows(&self, authorization: Option<&str>) -> bool {
         let Some(given) = authorization.and_then(|a| a.trim().strip_prefix("Bearer ")) else { return false };
-        let given = given.trim().as_bytes();
-        // Every byte compared, whatever differs first.
-        given.len() == self.token.len() && given.iter().zip(self.token.as_bytes()).fold(0u8, |diff, (a, b)| diff | (a ^ b)) == 0
+        same(given.trim().as_bytes(), self.token.as_bytes())
     }
 
     // An event heard at `now`: into the sessions, kept, and sent to each
@@ -283,8 +344,14 @@ impl Hub {
 
     // GET /v1/info, for the app `app` at `version`.
     pub fn info(&self, app: &str, version: &str) -> Value {
+        self.info_for(app, version, "")
+    }
+
+    // GET /v1/info?<query>: with ?nonce= (up to NONCE_MAX long), the proof
+    // that this hub knows its token (proof).
+    pub fn info_for(&self, app: &str, version: &str, query: &str) -> Value {
         let seq = self.state.lock().unwrap_or_else(|e| e.into_inner()).seq;
-        json!({
+        let mut info = json!({
             "api": API,
             "hub": env!("CARGO_PKG_VERSION"),
             "app": app,
@@ -293,7 +360,11 @@ impl Hub {
             "seq": seq,
             "capabilities": CAPABILITIES,
             "token": { "header": "Authorization: Bearer <token>", "file": self.token_file },
-        })
+        });
+        if let Some((_, nonce)) = pairs(query).into_iter().find(|(k, v)| k == "nonce" && !v.is_empty() && v.len() <= NONCE_MAX) {
+            info["proof"] = json!(proof(&self.token, &nonce));
+        }
+        info
     }
 
     // GET /v1/sessions?<query>.

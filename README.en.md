@@ -22,18 +22,19 @@ The hooks are installed and forwarded by the host app (Wakuwaku's way: its `docs
 
 One hub on a machine at a time: the app that holds port `47213` (`agent_hub::PORT`); an app that finds it taken is a client. A client:
 
-1. asks `GET http://127.0.0.1:47213/v1/info` (or at `AGENT_HUB_URL` when that is set: a test, another port; `agent_hub::url()`) and checks `api` is 1. No answer, or one with no `api`: no hub.
-2. reads the token from the file `token.file` names;
-3. asks `/v1/sessions` and `/v1/events` with `Authorization: Bearer <token>`.
+1. makes a random nonce and asks `GET http://127.0.0.1:47213/v1/info?nonce=<nonce>` (or at `AGENT_HUB_URL` when that is set: a test, another port; `agent_hub::url()`), and checks `api` is 1 and `capabilities` has `proof`. No answer, or one with no `api`: no hub.
+2. reads the token with `agent_hub::read_token(token.file)`: only a whole path to a file named `token`, 64 bytes at most, holding 32 lowercase hex digits; anything else is no hub, and nothing is sent.
+3. checks the answer's `proof` (HMAC-SHA256 of the nonce under the token) with `agent_hub::proves(token, nonce, proof)`; one that does not match is no hub.
+4. asks `/v1/sessions` and `/v1/events` with `Authorization: Bearer <token>`.
 
-Nothing is written anywhere else to find it by.
+Steps 2 and 3 because while no hub runs, another program on the machine (another user's too) may take the port and pose as one: to have the client read any file and send it as the token, or name the real token's file to have the token. What the hub tells is data to show, never what to do. Nothing is written anywhere else to find it by.
 
 ## Use
 
 ```toml
 [dependencies]
-agent-core = { git = "https://github.com/zhoupengjie/agent-hub", tag = "v0.1.0" }
-agent-hub = { git = "https://github.com/zhoupengjie/agent-hub", tag = "v0.1.0" }
+agent-core = { git = "https://github.com/zhoupengjie/agent-hub", tag = "v0.2.1" }
+agent-hub = { git = "https://github.com/zhoupengjie/agent-hub", tag = "v0.2.1" }
 ```
 
 ```rust
