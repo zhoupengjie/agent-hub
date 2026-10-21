@@ -315,3 +315,62 @@ fn the_hub_proves_it_knows_the_token() {
     }
     assert_eq!(hub.info("wakuwaku", "0.3.5")["hub"], env!("CARGO_PKG_VERSION"));
 }
+
+// A network path, a pipe, a device's: turned away by their text alone,
+// nothing opened, nothing sent over a network (192.0.2.1 is an address for
+// documents, reaching nothing). A drive's path is this machine's
+// (zhoupengjie/agent-hub#4).
+#[cfg(windows)]
+#[test]
+fn a_token_is_read_only_from_this_machine_s_disks() {
+    let start = std::time::Instant::now();
+    for p in [
+        r"\\192.0.2.1\share\token",
+        r"\\attacker@80\dav\token",
+        r"\\.\pipe\token",
+        r"\\?\UNC\192.0.2.1\share\token",
+        r"\\?\GLOBALROOT\Device\X\token",
+    ] {
+        assert!(!local_path(Path::new(p)), "{p}");
+        assert_eq!(read_token(Path::new(p)), None, "{p}");
+    }
+    assert!(start.elapsed() < Duration::from_secs(1), "nothing reached for");
+    assert!(local_path(Path::new(r"C:\data\token")) && local_path(Path::new(r"\\?\C:\data\token")));
+    assert!(!local_path(Path::new(r"C:token")) && !local_path(Path::new(r"\data\token")));
+}
+
+// A link named token is not read, though it points to a real token's file.
+// Windows lets a link be made only with the right (an administrator's, or
+// developer mode): without it, the real file alone.
+#[test]
+fn a_link_named_token_is_not_followed() {
+    let dir = std::env::temp_dir().join(format!("agent-hub-link-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("real")).unwrap();
+    std::fs::create_dir_all(dir.join("link")).unwrap();
+    let (target, link) = (dir.join("real").join("token"), dir.join("link").join("token"));
+    std::fs::write(&target, "0123456789abcdef0123456789abcdef").unwrap();
+    #[cfg(windows)]
+    let made = std::os::windows::fs::symlink_file(&target, &link).is_ok();
+    #[cfg(unix)]
+    let made = std::os::unix::fs::symlink(&target, &link).is_ok();
+    if made {
+        assert_eq!(read_token(&link), None);
+    }
+    assert_eq!(read_token(&target).as_deref(), Some("0123456789abcdef0123456789abcdef"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// A FIFO named token does not keep the client waiting.
+#[cfg(unix)]
+#[test]
+fn a_fifo_named_token_does_not_hang() {
+    let dir = std::env::temp_dir().join(format!("agent-hub-fifo-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let fifo = dir.join("token");
+    let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    assert_eq!(read_token(&fifo), None);
+    let _ = std::fs::remove_dir_all(&dir);
+}

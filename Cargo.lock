@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agent-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "ruzstd",
  "serde",
@@ -13,9 +13,10 @@ dependencies = [
 
 [[package]]
 name = "agent-hub"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "agent-core",
+ "libc",
  "serde",
  "serde_json",
  "sha2",

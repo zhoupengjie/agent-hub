@@ -215,17 +215,62 @@ fn is_token(text: &str) -> bool {
 // A hub's token as a client reads it, from the file /v1/info names
 // (token.file), or None: then it is no hub's, and the client sends nothing.
 // Whatever holds the port may name any file (one of the person's keys, for
-// the client to read and send it), so only a token's is read: a whole path
-// to a file named token, 64 bytes at most, holding a token's form
-// (zhoupengjie/agent-hub#4).
+// the client to read and send it), so only a token's is read: a file named
+// token on this machine's own disks, itself and not a link, 64 bytes at
+// most, holding a token's form (zhoupengjie/agent-hub#4). Before anything
+// is opened the path alone is looked at (local_path): opening a network
+// path (\\host\share\…, WebDAV) would already send the person's sign-in to
+// it, and a pipe would be its server's to answer.
 pub fn read_token(path: &Path) -> Option<String> {
-    if !path.is_absolute() || path.file_name()? != "token" {
+    if !local_path(path) || path.file_name()? != "token" {
+        return None;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    // The file itself, not where a link points (a local one may point to a
+    // network path); on Unix, a FIFO not waited on.
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path).ok()?;
+    // What was opened, by its handle (no other look by the path, which may
+    // change in between): a plain file, small.
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.len() > 64 {
         return None;
     }
     let mut text = String::new();
-    std::fs::File::open(path).ok()?.take(65).read_to_string(&mut text).ok()?;
+    file.take(65).read_to_string(&mut text).ok()?;
     let token = text.trim();
     (text.len() <= 64 && is_token(token)).then(|| token.to_string())
+}
+
+// Whether a path is a whole one on this machine's own disks, by its text
+// alone (nothing opened, nothing asked of the file system: that would reach
+// a network path already). On Windows a drive's (C:\…, \\?\C:\…), not a
+// network path (\\host\share\…, \\?\UNC\…), a device's (\\.\pipe\…) or
+// another verbatim one (\\?\GLOBALROOT\…).
+fn local_path(path: &Path) -> bool {
+    if !path.is_absolute() {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        matches!(path.components().next(), Some(Component::Prefix(p)) if matches!(p.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_)))
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
 }
 
 // What a hub that knows `token` answers a client's nonce with (/v1/info?
