@@ -339,6 +339,55 @@ fn a_token_is_read_only_from_this_machine_s_disks() {
     assert!(!local_path(Path::new(r"C:token")) && !local_path(Path::new(r"\data\token")));
 }
 
+// A volume's path by its name (\\?\Volume{…}\…, a volume's with no drive
+// letter) is read; a name of another form there is not.
+#[cfg(windows)]
+#[test]
+fn a_token_is_read_by_its_volume_s_name() {
+    let guid = r"\\?\Volume{0b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0}";
+    assert!(local_path(Path::new(&format!(r"{guid}\data\token"))));
+    for p in [
+        r"\\.\Volume{0b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0}\data\token",
+        r"\\?\Volume{0b1c2d3e-4f50-6172-8394-a5b6c7d8e9f}\data\token",
+        r"\\?\Volume{0b1c2d3e-4f50-6172-8394-a5b6c7d8e9fg}\data\token",
+        r"\\?\Volume{0b1c2d3e4f50-6172-8394-a5b6c7d8e9f00}\data\token",
+        r"\\?\Volume0b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0\data\token",
+        r"\\?\Volume{0b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0}x\data\token",
+        r"\\?\HarddiskVolume3\data\token",
+    ] {
+        assert!(!local_path(Path::new(p)), "{p}");
+    }
+    let dir = std::env::temp_dir().join(format!("agent-hub-volume-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("token"), "0123456789abcdef0123456789abcdef").unwrap();
+    let by_volume = volume_path(&dir.join("token")).expect("the temp folder's volume has a name");
+    let text = by_volume.to_str().unwrap();
+    assert!(text.starts_with(r"\\?\Volume{") && text.ends_with(r"\token"), "{text}");
+    assert_eq!(read_token(&by_volume).as_deref(), Some("0123456789abcdef0123456789abcdef"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// A hub whose folder is on a volume mounted on a folder (no drive letter)
+// names its token's file so that a client reads it. Needs such a folder,
+// made by an administrator, named in AGENT_HUB_TEST_MOUNTED:
+// cargo test -- --ignored a_hub_on_a_mounted_volume
+#[cfg(windows)]
+#[test]
+#[ignore]
+fn a_hub_on_a_mounted_volume_names_its_token_s_file_as_a_client_reads_it() {
+    let mounted = std::env::var("AGENT_HUB_TEST_MOUNTED").expect("AGENT_HUB_TEST_MOUNTED: a folder on a volume mounted on a folder");
+    let dir = Path::new(&mounted).join(format!("agent-hub-mounted-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let hub = Hub::open(&dir, 0).unwrap();
+    assert_eq!(read_token(hub.token_file()), None, "not through the folder the volume is mounted on");
+    let named = hub.info_for("wakuwaku", "0.3.5", "")["token"]["file"].as_str().unwrap().to_string();
+    println!("named: {named}");
+    let token = read_token(Path::new(&named)).expect("its token, read");
+    assert!(hub.allows(Some(&format!("Bearer {token}"))));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // A link named token is not read, though it points to a real token's file.
 // Windows lets a link be made only with the right (an administrator's, or
 // developer mode): without it, the real file alone.

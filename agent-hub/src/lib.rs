@@ -262,9 +262,11 @@ pub fn read_token(path: &Path) -> Option<String> {
 
 // Whether a path is a whole one on this machine's own disks, by its text
 // alone (nothing opened, nothing asked of the file system: that would reach
-// a network path already). On Windows a drive's (C:\…, \\?\C:\…), not a
-// network path (\\host\share\…, \\?\UNC\…), a device's (\\.\pipe\…) or
-// another verbatim one (\\?\GLOBALROOT\…).
+// a network path already). On Windows a drive's (C:\…, \\?\C:\…) or a
+// volume's by the name Windows gives it (\\?\Volume{…}\…: one with no
+// drive letter has only that), not a network path (\\host\share\…,
+// \\?\UNC\…), a device's (\\.\pipe\…) or another verbatim one
+// (\\?\GLOBALROOT\…).
 fn local_path(path: &Path) -> bool {
     if !path.is_absolute() {
         return false;
@@ -272,12 +274,60 @@ fn local_path(path: &Path) -> bool {
     #[cfg(windows)]
     {
         use std::path::{Component, Prefix};
-        matches!(path.components().next(), Some(Component::Prefix(p)) if matches!(p.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_)))
+        matches!(path.components().next(), Some(Component::Prefix(p)) if match p.kind() {
+            Prefix::Disk(_) | Prefix::VerbatimDisk(_) => true,
+            Prefix::Verbatim(name) => volume_name(name),
+            _ => false,
+        })
     }
     #[cfg(not(windows))]
     {
         true
     }
+}
+
+// Whether a name is a volume's as Windows names it, Volume{GUID} (the
+// mount manager's, made for this machine's volumes alone; a share is never
+// one).
+#[cfg(windows)]
+fn volume_name(name: &std::ffi::OsStr) -> bool {
+    let Some(guid) = name.to_str().and_then(|n| n.strip_prefix("Volume{")).and_then(|n| n.strip_suffix('}')) else { return false };
+    guid.len() == 36 && guid.bytes().enumerate().all(|(i, b)| if matches!(i, 8 | 13 | 18 | 23) { b == b'-' } else { b.is_ascii_hexdigit() })
+}
+
+// A file's path by its volume's name (\\?\Volume{…}\…), links taken out:
+// how a hub names its token's file where the drive's path would not be
+// read, one through a folder a volume is mounted on (Windows takes that
+// for a junction, and so does no_linked_folder).
+#[cfg(windows)]
+fn volume_path(path: &Path) -> Option<PathBuf> {
+    use std::os::windows::{ffi::OsStringExt, io::AsRawHandle};
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetFinalPathNameByHandleW(file: *mut std::ffi::c_void, path: *mut u16, len: u32, flags: u32) -> u32;
+    }
+    const VOLUME_NAME_GUID: u32 = 0x1;
+    let file = std::fs::File::open(path).ok()?;
+    let mut buf = vec![0u16; 300];
+    loop {
+        // SAFETY: the handle is open for the call; buf holds len u16s.
+        let n = unsafe { GetFinalPathNameByHandleW(file.as_raw_handle(), buf.as_mut_ptr(), buf.len() as u32, VOLUME_NAME_GUID) } as usize;
+        if n == 0 || n > 32_768 {
+            return None;
+        }
+        if n < buf.len() {
+            buf.truncate(n);
+            return Some(PathBuf::from(std::ffi::OsString::from_wide(&buf)));
+        }
+        buf.resize(n, 0);
+    }
+}
+
+// Whether a client would read a token's file by this path (its checks
+// before it opens it).
+#[cfg(windows)]
+fn read_by(path: &Path) -> bool {
+    local_path(path) && no_linked_folder(path)
 }
 
 // Whether every folder above a file, from the root down, is a plain folder:
@@ -367,9 +417,18 @@ impl Hub {
 
     // The token's file as a client is told it (/v1/info): by its path with
     // links and junctions taken out (\\?\C:\…), which a client's check
-    // (read_token: no linked folder) takes; as it is where that cannot be had.
+    // (read_token: no linked folder) takes; where that path would still not
+    // be read (through a folder a volume is mounted on), by its volume's
+    // name (\\?\Volume{…}\…); as it is where neither can be had.
     pub fn token_file_named(&self) -> PathBuf {
-        std::fs::canonicalize(&self.token_file).unwrap_or_else(|_| self.token_file.clone())
+        let Ok(named) = std::fs::canonicalize(&self.token_file) else { return self.token_file.clone() };
+        #[cfg(windows)]
+        if !read_by(&named) {
+            if let Some(by_volume) = volume_path(&self.token_file).filter(|p| read_by(p)) {
+                return by_volume;
+            }
+        }
+        named
     }
 
     // Whether a request's Authorization header carries the token.

@@ -23,7 +23,7 @@ hook 由宿主应用安装、转发（Wakuwaku 的做法见它的 `docs/DEVELOPM
 一台机器同一时间只有一个 hub：占着端口 `47213`（`agent_hub::PORT`）的那个应用；后起来的应用发现端口被占，就当客户端。客户端：
 
 1. 生成一个随机的 nonce（至少 128 位，用系统的随机数，比如 16 个随机字节转成十六进制），问 `GET http://127.0.0.1:47213/v1/info?nonce=<nonce>`（设了环境变量 `AGENT_HUB_URL` 就用它：测试、换端口时；`agent_hub::url()`），确认 `api` 是 1、`capabilities` 里有 `proof`。没有回答，或回答里没有 `api`，就是没有 hub。
-2. 用 `agent_hub::read_token(token.file)` 读令牌：只认这台电脑本地盘上的完整路径（网络路径、管道、设备路径只看字符串就拒绝，碰都不碰，免得把登录凭据发给对方）、文件名是 `token`、文件本身和上面每一级目录都不是链接或联接点（hub 报的 `token.file` 是去掉了链接的规范化路径，`\\?\C:\…`）、最多 64 字节、内容正好是 32 位小写十六进制，否则当作没有 hub，什么都不发。
+2. 用 `agent_hub::read_token(token.file)` 读令牌：只认这台电脑本地盘上的完整路径（网络路径、管道、设备路径只看字符串就拒绝，碰都不碰，免得把登录凭据发给对方）、文件名是 `token`、文件本身和上面每一级目录都不是链接或联接点（hub 报的 `token.file` 是去掉了链接的规范化路径，`\\?\C:\…`；数据目录在挂到文件夹、没有盘符的卷上时，报这个卷的名字开头的路径，`\\?\Volume{…}\…`）、最多 64 字节、内容正好是 32 位小写十六进制，否则当作没有 hub，什么都不发。
 3. 用 `agent_hub::proves(令牌, nonce, proof)` 核对回答里的 `proof`（令牌对 nonce 的 HMAC-SHA256），对不上就当作没有 hub。
 4. 带着 `Authorization: Bearer <令牌>` 请求 `/v1/sessions`、`/v1/events`。
 
@@ -33,8 +33,8 @@ hook 由宿主应用安装、转发（Wakuwaku 的做法见它的 `docs/DEVELOPM
 
 ```toml
 [dependencies]
-agent-core = { git = "https://github.com/zhoupengjie/agent-hub", tag = "v0.2.3" }
-agent-hub = { git = "https://github.com/zhoupengjie/agent-hub", tag = "v0.2.3" }
+agent-core = { git = "https://github.com/zhoupengjie/agent-hub", tag = "v0.2.4" }
+agent-hub = { git = "https://github.com/zhoupengjie/agent-hub", tag = "v0.2.4" }
 ```
 
 ```rust
