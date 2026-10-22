@@ -33,8 +33,8 @@ Steps 2 and 3 because while no hub runs, another program on the machine (another
 
 ```toml
 [dependencies]
-agent-core = { git = "https://github.com/zhoupengjie/agent-hub", tag = "v0.2.4" }
-agent-hub = { git = "https://github.com/zhoupengjie/agent-hub", tag = "v0.2.4" }
+agent-core = { git = "https://github.com/zhoupengjie/agent-hub", tag = "v0.2.5" }
+agent-hub = { git = "https://github.com/zhoupengjie/agent-hub", tag = "v0.2.5" }
 ```
 
 ```rust

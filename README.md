@@ -33,8 +33,8 @@ hook 由宿主应用安装、转发（Wakuwaku 的做法见它的 `docs/DEVELOPM
 
 ```toml
 [dependencies]
-agent-core = { git = "https://github.com/zhoupengjie/agent-hub", tag = "v0.2.4" }
-agent-hub = { git = "https://github.com/zhoupengjie/agent-hub", tag = "v0.2.4" }
+agent-core = { git = "https://github.com/zhoupengjie/agent-hub", tag = "v0.2.5" }
+agent-hub = { git = "https://github.com/zhoupengjie/agent-hub", tag = "v0.2.5" }
 ```
 
 ```rust
