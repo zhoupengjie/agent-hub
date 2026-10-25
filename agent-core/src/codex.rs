@@ -5,7 +5,8 @@
 // Bash and every edit is apply_patch (the patch is tool_input.command,
 // which OpenCode's patch tool takes too: patched); a command that fails gets
 // a PostToolUse as one that worked, its failure only in Codex's own record of
-// the session (command_failed); a failed request gets no Stop; Interrupt is the person stopping
+// the session (command_failed); a request to approve is Codex's own to
+// answer where the person let it (auto_reviewed); a failed request gets no Stop; Interrupt is the person stopping
 // a turn. Each step's hooks may run in the background, so one can arrive
 // after its turn is over: the turn id tells it apart. Its desktop app asks
 // a model things of its own accord too (a suggested next message for the
@@ -128,6 +129,32 @@ pub fn command_failed(rollout: &str, id: &str) -> bool {
         .is_some_and(|code| code != 0)
 }
 
+// Whether Codex approves the session's requests itself: the person let it
+// (the desktop app's Approve for me; approvals_reviewer = "auto_review",
+// "guardian_subagent" before). Codex runs the PermissionRequest hooks first,
+// and asks its own reviewer, never the person, once none answered: one held
+// for the person to answer only kept them from it (zhoupengjie/Wakuwaku#90).
+// The hook does not say (its permission_mode is "default" either way); the
+// session's rollout does, in the settings Codex writes as each turn the
+// person begins starts, before any of its steps (turn_context): the latest is
+// this turn's. Its last MiB read, all of it where that has none (a turn that
+// printed much). Undocumented, as Codex writes it now (CLI 0.162): not when
+// it reads otherwise, nor with no rollout.
+pub fn auto_reviewed(rollout: &str) -> bool {
+    let latest = |lines: &str| {
+        lines
+            .lines()
+            .rev()
+            .filter(|line| line.contains("\"turn_context\""))
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|entry| s(entry, "type") == "turn_context")
+            .map(|entry| s(&entry["payload"], "approvals_reviewer").to_string())
+    };
+    let Some(end) = tail(rollout, ROLLOUT_TAIL) else { return false };
+    let reviewer = latest(&end).or_else(|| tail(rollout, u64::MAX).and_then(|all| latest(&all)));
+    matches!(reviewer.as_deref(), Some("auto_review" | "guardian_subagent"))
+}
+
 // A Codex hook event as a session's doing, or None for one that changes nothing.
 pub fn to_event(e: &Value) -> Option<AgentEvent> {
     if !e.is_object() {
@@ -154,6 +181,8 @@ pub fn to_event(e: &Value) -> Option<AgentEvent> {
             let files: Vec<String> = if tool == "apply_patch" { patched(s(&input, "command")).iter().map(|f| absolute(s(e, "cwd"), f)).collect() } else { Vec::new() };
             Kind::ToolDone { call: Call { file: files.first().cloned(), files, ..call() } }
         }
+        // Codex's own to approve, not the person's: nothing waits on them.
+        "PermissionRequest" if auto_reviewed(s(e, "transcript_path")) => return None,
         "PermissionRequest" => Kind::Waiting { wait: Wait::Approval { what: What::Call { call: call() }, answer_in: AnswerIn::Here } },
         "Stop" => Kind::Done,
         // Stopped by the person.
@@ -221,6 +250,42 @@ mod tests {
         // Only a shell command's; none with no rollout (--ephemeral).
         assert!(matches!(done("exec-1", "apply_patch", &path), Kind::ToolDone { .. }));
         assert!(matches!(done("exec-1", "Bash", ""), Kind::ToolDone { .. }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Approve for me (approvals_reviewer auto_review, as the turn's settings
+    // in the rollout say): a request to approve is Codex's, nothing waits on
+    // the person; the person's to answer (user) waits as ever, as with no
+    // rollout. The latest turn's settings count (zhoupengjie/Wakuwaku#90).
+    #[test]
+    fn a_request_codex_approves_itself() {
+        let dir = std::env::temp_dir().join(format!("agent-core-codex-review-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let turn = |id: &str, reviewer: Option<&str>| {
+            let mut payload = json!({ "turn_id": id, "cwd": "D:\\w", "approval_policy": "on-request", "sandbox_policy": { "type": "workspace-write" }, "model": "gpt-5.6" });
+            if let Some(r) = reviewer {
+                payload["approvals_reviewer"] = json!(r);
+            }
+            json!({ "timestamp": "2026-10-25T10:00:00.000Z", "type": "turn_context", "payload": payload }).to_string()
+        };
+        let said = json!({ "type": "response_item", "payload": { "type": "message", "role": "user", "content": "say \"turn_context\" once" } }).to_string();
+        let write = |name: &str, lines: &[String]| {
+            let path = dir.join(name);
+            std::fs::write(&path, lines.join("\n")).unwrap();
+            path.to_string_lossy().to_string()
+        };
+        let auto = write("auto.jsonl", &[turn("t1", Some("user")), said.clone(), turn("t2", Some("auto_review")), said.clone()]);
+        let back = write("back.jsonl", &[turn("t1", Some("auto_review")), turn("t2", Some("user"))]);
+        let older = write("older.jsonl", &[turn("t1", Some("guardian_subagent"))]);
+        let none = write("none.jsonl", &[turn("t1", None)]);
+        assert_eq!((auto_reviewed(&auto), auto_reviewed(&back), auto_reviewed(&older), auto_reviewed(&none), auto_reviewed("")), (true, false, true, false, false));
+        let ask = |rollout: &str| to_event(&hook("PermissionRequest", "review-90", "t2", json!({ "tool_name": "Bash", "tool_use_id": "exec-9", "tool_input": { "command": "npm install" }, "transcript_path": rollout })));
+        assert!(ask(&auto).is_none());
+        assert!(matches!(ask(&back).unwrap().kind, Kind::Waiting { wait: Wait::Approval { .. } }));
+        assert!(matches!(ask("").unwrap().kind, Kind::Waiting { wait: Wait::Approval { .. } }));
+        // Its settings further back than the end read: found all the same.
+        let long = write("long.jsonl", &[turn("t1", Some("auto_review")), "x".repeat(ROLLOUT_TAIL as usize + 10)]);
+        assert!(auto_reviewed(&long));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
