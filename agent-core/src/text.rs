@@ -1,4 +1,6 @@
 // Text as the agents' events carry it.
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 
 // At most `max` characters, trimmed; a cut one ends in "…".
 pub fn clip(text: &str, max: usize) -> String {
@@ -23,6 +25,20 @@ pub fn absolute(cwd: &str, path: &str) -> String {
         return path.to_string();
     }
     std::path::Path::new(cwd).join(path).to_string_lossy().into_owned()
+}
+
+// The last `max` bytes of a file (a transcript's latest lines, the first
+// perhaps cut), or None for no path or no file.
+pub fn tail(path: &str, max: u64) -> Option<String> {
+    if path.is_empty() {
+        return None;
+    }
+    let mut file = File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    file.seek(SeekFrom::Start(len.saturating_sub(max))).ok()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 #[cfg(test)]

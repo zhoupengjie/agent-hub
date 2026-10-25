@@ -3,8 +3,9 @@
 // Codex runs its hooks as commands (an app's own program, which hands each
 // event to the app's port). What differs from Claude Code: the shell tool is
 // Bash and every edit is apply_patch (the patch is tool_input.command,
-// which OpenCode's patch tool takes too: patched); a failed tool call gets
-// no PostToolUse, a failed request no Stop; Interrupt is the person stopping
+// which OpenCode's patch tool takes too: patched); a command that fails gets
+// a PostToolUse as one that worked, its failure only in Codex's own record of
+// the session (command_failed); a failed request gets no Stop; Interrupt is the person stopping
 // a turn. Each step's hooks may run in the background, so one can arrive
 // after its turn is over: the turn id tells it apart. Its desktop app asks
 // a model things of its own accord too (a suggested next message for the
@@ -16,7 +17,7 @@ use serde_json::Value;
 
 use crate::event::{given, Agent, AgentEvent, AnswerIn, Call, Kind, Wait, What};
 use crate::s;
-use crate::text::absolute;
+use crate::text::{absolute, tail};
 
 // What the desktop app's own requests begin with ("This is an app-generated
 // request for a suggested next user message…", zhoupengjie/Wakuwaku#74).
@@ -99,6 +100,34 @@ pub fn patched(patch: &str) -> Vec<&str> {
         .collect()
 }
 
+// So much of a rollout's end is read for a command's ending: its line, with
+// all the command printed (a few hundred KB at most seen), is written before
+// its PostToolUse runs, and only a few lines after it by the time a hook in
+// the background reads it.
+const ROLLOUT_TAIL: u64 = 1024 * 1024;
+
+// Whether the shell command `id` failed. Its PostToolUse says only what it
+// printed, a non-zero exit as a zero one (CLI 0.162); the session's rollout
+// (the hook's transcript_path) has its ending by then, as Codex writes it:
+// an event_msg item_completed whose item is a CommandExecution of the hook's
+// tool_use_id, with its exit_code. Undocumented: not failed when it reads
+// otherwise, nor with no rollout (codex exec --ephemeral).
+pub fn command_failed(rollout: &str, id: &str) -> bool {
+    if id.is_empty() {
+        return false;
+    }
+    let Some(lines) = tail(rollout, ROLLOUT_TAIL) else { return false };
+    let quoted = format!("\"{id}\"");
+    lines
+        .lines()
+        .rev()
+        .filter(|line| line.contains("\"item_completed\"") && line.contains(&quoted))
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|entry| s(&entry["payload"], "type") == "item_completed" && s(&entry["payload"]["item"], "type") == "CommandExecution" && s(&entry["payload"]["item"], "id") == id)
+        .and_then(|entry| entry["payload"]["item"]["exit_code"].as_i64())
+        .is_some_and(|code| code != 0)
+}
+
 // A Codex hook event as a session's doing, or None for one that changes nothing.
 pub fn to_event(e: &Value) -> Option<AgentEvent> {
     if !e.is_object() {
@@ -119,6 +148,7 @@ pub fn to_event(e: &Value) -> Option<AgentEvent> {
         // Its question to the person waits on them like a prompt.
         "PreToolUse" if tool == "request_user_input" => Kind::Waiting { wait: Wait::question() },
         "PreToolUse" => Kind::ToolStart { call: call() },
+        "PostToolUse" if tool == "Bash" && command_failed(s(e, "transcript_path"), s(e, "tool_use_id")) => Kind::ToolFailed { call: call(), quiet: false },
         // Every file its patch changed, by its whole path.
         "PostToolUse" => {
             let files: Vec<String> = if tool == "apply_patch" { patched(s(&input, "command")).iter().map(|f| absolute(s(e, "cwd"), f)).collect() } else { Vec::new() };
@@ -161,6 +191,37 @@ mod tests {
         let done = json!({ "hook_event_name": "PostToolUse", "session_id": "s", "cwd": "D:\\w", "tool_name": "apply_patch", "tool_input": { "command": patch } });
         let Some(AgentEvent { kind: Kind::ToolDone { call }, .. }) = to_event(&done) else { panic!("no tool done") };
         assert_eq!((call.file.as_deref(), call.files.as_slice()), (Some("D:\\w\\hello.txt"), &["D:\\w\\hello.txt".to_string(), "D:\\w\\b.txt".into(), "D:\\w\\old.txt".into()][..]));
+    }
+
+    // A command that exits non-zero: failed, by the rollout's record of it
+    // (CLI 0.162.1, as measured); one that exits 0, one not in it, one with
+    // no rollout: done as before.
+    #[test]
+    fn a_command_failed_by_its_exit_code() {
+        let dir = std::env::temp_dir().join(format!("agent-core-codex-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rollout = dir.join("rollout.jsonl");
+        let ended = |id: &str, code: i64, status: &str| {
+            json!({ "timestamp": "2026-10-25T17:33:20.000Z", "type": "event_msg", "payload": { "type": "item_completed", "thread_id": "th", "turn_id": "t1", "item": { "type": "CommandExecution", "id": id, "command": ["pwsh.exe", "-Command", "x"], "status": status, "aggregated_output": format!("\"{id}\" printed"), "exit_code": code } } }).to_string()
+        };
+        let lines = [
+            // The first line read, cut.
+            r#"utput":"…","exit_code":1}}}"#.to_string(),
+            ended("exec-1", 1, "failed"),
+            ended("exec-2", 0, "completed"),
+            json!({ "type": "response_item", "payload": { "type": "message", "role": "assistant", "content": "exec-3 next" } }).to_string(),
+        ];
+        std::fs::write(&rollout, lines.join("\n")).unwrap();
+        let path = rollout.to_string_lossy().to_string();
+        assert_eq!((command_failed(&path, "exec-1"), command_failed(&path, "exec-2"), command_failed(&path, "exec-3"), command_failed(&path, "")), (true, false, false, false));
+        assert!(!command_failed("Z:\\no\\such\\rollout.jsonl", "exec-1"));
+        let done = |id: &str, tool: &str, rollout: &str| to_event(&hook("PostToolUse", "fail", "t1", json!({ "tool_name": tool, "tool_use_id": id, "tool_input": { "command": "Get-Item nope" }, "tool_response": "Get-Item: not found", "transcript_path": rollout }))).unwrap().kind;
+        assert!(matches!(done("exec-1", "Bash", &path), Kind::ToolFailed { call, quiet: false } if call.id.as_deref() == Some("exec-1")));
+        assert!(matches!(done("exec-2", "Bash", &path), Kind::ToolDone { .. }));
+        // Only a shell command's; none with no rollout (--ephemeral).
+        assert!(matches!(done("exec-1", "apply_patch", &path), Kind::ToolDone { .. }));
+        assert!(matches!(done("exec-1", "Bash", ""), Kind::ToolDone { .. }));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // The person's words, as the desktop app hands them on with what they

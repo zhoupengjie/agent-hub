@@ -21,13 +21,11 @@
 // again from invocationNum 0, then Stop, fully idle. That second start is the
 // same turn: a turn is known by the person's USER_INPUT step it answers
 // (turn), else it counts twice and its time from the second start.
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
-
 use serde_json::{json, Value};
 
 use crate::event::{given, Agent, AgentEvent, Call, Failure, Kind};
 use crate::s;
+use crate::text::tail;
 
 // An Antigravity hook event (its name put in by the program that hands it
 // on) as a session's doing, given the person's words and the last reply
@@ -89,7 +87,7 @@ pub fn with_transcript(e: &mut Value) {
         "Stop" => "PLANNER_RESPONSE",
         _ => return,
     };
-    let Some(lines) = tail(s(e, "transcriptPath")) else { return };
+    let Some(lines) = tail(s(e, "transcriptPath"), TAIL) else { return };
     let mut steps = lines.lines().rev().filter_map(|line| serde_json::from_str::<Value>(line).ok());
     if wants == "USER_INPUT" {
         // The person's last words, with or without any (an image alone).
@@ -105,16 +103,4 @@ pub fn with_transcript(e: &mut Value) {
     } else if let Some(step) = steps.find(|step| s(step, "type") == wants && !s(step, "content").trim().is_empty()) {
         e["last_assistant_message"] = json!(s(&step, "content").trim());
     }
-}
-
-fn tail(path: &str) -> Option<String> {
-    if path.is_empty() {
-        return None;
-    }
-    let mut file = File::open(path).ok()?;
-    let len = file.metadata().ok()?.len();
-    file.seek(SeekFrom::Start(len.saturating_sub(TAIL))).ok()?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).ok()?;
-    Some(String::from_utf8_lossy(&bytes).into_owned())
 }
