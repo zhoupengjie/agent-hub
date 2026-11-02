@@ -30,6 +30,7 @@ pub enum Agent {
     Zcode,
     Reasonix,
     Dsh,
+    Workbuddy,
 }
 
 impl Agent {
@@ -44,6 +45,7 @@ impl Agent {
             Some("zcode") => Agent::Zcode,
             Some("reasonix") => Agent::Reasonix,
             Some("dsh") => Agent::Dsh,
+            Some("workbuddy") => Agent::Workbuddy,
             _ => Agent::Claude,
         }
     }
@@ -59,6 +61,7 @@ impl Agent {
             Agent::Zcode => Some("zcode"),
             Agent::Reasonix => Some("reasonix"),
             Agent::Dsh => Some("dsh"),
+            Agent::Workbuddy => Some("workbuddy"),
         }
     }
 }
@@ -272,7 +275,7 @@ impl AgentEvent {
 impl Agent {
     // By its name as serialized ("claude" too, as from_tag has it not).
     pub fn named(name: &str) -> Option<Agent> {
-        [Agent::Claude, Agent::Codex, Agent::Agy, Agent::Opencode, Agent::Omp, Agent::Zcode, Agent::Reasonix, Agent::Dsh].into_iter().find(|a| a.tag().unwrap_or("claude") == name)
+        [Agent::Claude, Agent::Codex, Agent::Agy, Agent::Opencode, Agent::Omp, Agent::Zcode, Agent::Reasonix, Agent::Dsh, Agent::Workbuddy].into_iter().find(|a| a.tag().unwrap_or("claude") == name)
     }
 }
 
@@ -462,5 +465,17 @@ mod tests {
         for wrong in [json!({ "agent": "claude", "session": "a" }), json!({ "agent": "nobody", "session": "a", "type": "done" }), json!({ "session": "a", "type": "done" }), json!({ "agent": "claude", "session": "a", "type": "sleep" }), json!({ "agent": "claude", "session": 7, "type": "done" }), json!({ "agent": "claude", "session": "a", "type": "waiting", "wait": { "for": "approval", "what": { "as": "said", "said": "x" } } }), json!("done")] {
             assert!(AgentEvent::from_json(&wrong).is_err(), "{wrong}");
         }
+    }
+
+    // WorkBuddy has a name of its own, and reads back as the agent it is.
+    #[test]
+    fn workbuddy_is_an_agent_of_its_own() {
+        assert_eq!(Agent::from_tag(Some("workbuddy")), Agent::Workbuddy);
+        assert_eq!(Agent::Workbuddy.tag(), Some("workbuddy"));
+        assert_eq!(Agent::named("workbuddy"), Some(Agent::Workbuddy));
+        let ev = AgentEvent { agent: Agent::Workbuddy, session: "s".into(), within: false, cwd: None, turn: None, title: None, reply: None, kind: Kind::Done };
+        let sent = serde_json::to_value(&ev).unwrap();
+        assert_eq!(sent["agent"], json!("workbuddy"));
+        assert_eq!(AgentEvent::from_json(&sent), Ok(ev));
     }
 }
