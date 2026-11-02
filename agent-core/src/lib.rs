@@ -16,6 +16,8 @@
 //   dsh       DeepSeek Harness's events: its tools by Claude Code's names, a
 //             prompt as an app reads one, a session's name, log, last reply,
 //             lineage
+//   workbuddy WorkBuddy's events in Claude Code's names (its hooks are
+//             Claude Code's, its desktop's config dir is ~/.workbuddy)
 //   asks      the prompts waiting on the person: what each is, the hook's
 //             reply for each choice, when one is settled elsewhere
 //   registry  the sessions known from their events: status, turn, calls
@@ -57,7 +59,7 @@ pub struct Context<'a> {
 // call's truncated).
 pub fn read(agent: Agent, e: &mut Value, ctx: &Context) -> Option<AgentEvent> {
     let mut ev = match agent {
-        Agent::Claude | Agent::Zcode => claude::to_event(e, agent),
+        Agent::Claude | Agent::Zcode | Agent::Workbuddy => claude::to_event(e, agent),
         Agent::Codex => codex::to_event(e),
         Agent::Agy => agy::to_event(e),
         Agent::Opencode => opencode::to_event(e),
@@ -93,5 +95,19 @@ mod tests {
         assert!(matches!(ev.kind, event::Kind::ToolStart { call } if call.truncated));
         e["tool_input_truncated"] = json!(false);
         assert!(matches!(read(Agent::Claude, &mut e, &ctx).unwrap().kind, event::Kind::ToolStart { call } if !call.truncated));
+    }
+
+    // WorkBuddy's events are Claude Code's, read the same way, named its own.
+    #[test]
+    fn workbuddy_events_are_read_as_claude_code_s() {
+        let home = std::path::Path::new("Z:/nowhere/.dsh");
+        let ctx = Context { now: 0, dsh_home: home };
+        let mut e = json!({ "hook_event_name": "Stop", "session_id": "s" });
+        let ev = read(Agent::Workbuddy, &mut e, &ctx).unwrap();
+        assert_eq!(ev.agent, Agent::Workbuddy);
+        assert_eq!(ev.kind, event::Kind::Done);
+        let mut e = json!({ "hook_event_name": "PreToolUse", "session_id": "s", "tool_name": "Write", "tool_input": { "file_path": "a.md", "content": "x" } });
+        let ev = read(Agent::Workbuddy, &mut e, &ctx).unwrap();
+        assert!(matches!(ev.kind, event::Kind::ToolStart { call } if call.tool == "Write"));
     }
 }

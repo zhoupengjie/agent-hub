@@ -4,7 +4,7 @@
 
 Two Rust crates for following coding agents' sessions: what a session is doing, read from the agent's hook events (and the transcript and session log it leaves), told to other apps on the same machine. [Wakuwaku](https://github.com/zhoupengjie/Wakuwaku), a desktop pet and taskbar that follows your agents at work, is built on them.
 
-Supported: Claude Code, Codex, Antigravity (agy), OpenCode, oh-my-pi (omp), ZCode, Reasonix, DeepSeek Harness.
+Supported: Claude Code, Codex, Antigravity (agy), OpenCode, oh-my-pi (omp), ZCode, Reasonix, DeepSeek Harness, WorkBuddy.
 
 ## The two crates
 
@@ -33,8 +33,8 @@ Steps 2 and 3 because while no hub runs, another program on the machine (another
 
 ```toml
 [dependencies]
-agent-core = { git = "https://github.com/zhoupengjie/agent-hub", tag = "v0.2.7" }
-agent-hub = { git = "https://github.com/zhoupengjie/agent-hub", tag = "v0.2.7" }
+agent-core = { git = "https://github.com/zhoupengjie/agent-hub", tag = "v0.2.8" }
+agent-hub = { git = "https://github.com/zhoupengjie/agent-hub", tag = "v0.2.8" }
 ```
 
 ```rust

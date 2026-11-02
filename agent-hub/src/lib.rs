@@ -109,7 +109,7 @@ impl Filter {
             }
         }
         if filter.agents.is_empty() && !unknown.is_empty() {
-            return Err(format!("no agent {} (claude, codex, agy, opencode, omp, zcode, reasonix, dsh)", unknown.join(", ")));
+            return Err(format!("no agent {} (claude, codex, agy, opencode, omp, zcode, reasonix, dsh, workbuddy)", unknown.join(", ")));
         }
         Ok(filter)
     }

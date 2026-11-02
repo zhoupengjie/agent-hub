@@ -4,7 +4,7 @@
 
 跟踪 coding agent 会话的两个 Rust crate：从 agent 的 hook 事件（和它留下的会话记录、会话日志）读出“这个会话在做什么”，再告诉本机别的应用。[Wakuwaku](https://github.com/zhoupengjie/Wakuwaku)（跟着 agent 干活的桌面宠物和任务栏）用的就是它们。
 
-支持：Claude Code、Codex、Antigravity（agy）、OpenCode、oh-my-pi（omp）、ZCode、Reasonix、DeepSeek Harness。
+支持：Claude Code、Codex、Antigravity（agy）、OpenCode、oh-my-pi（omp）、ZCode、Reasonix、DeepSeek Harness、WorkBuddy。
 
 ## 两个 crate
 
@@ -33,8 +33,8 @@ hook 由宿主应用安装、转发（Wakuwaku 的做法见它的 `docs/DEVELOPM
 
 ```toml
 [dependencies]
-agent-core = { git = "https://github.com/zhoupengjie/agent-hub", tag = "v0.2.7" }
-agent-hub = { git = "https://github.com/zhoupengjie/agent-hub", tag = "v0.2.7" }
+agent-core = { git = "https://github.com/zhoupengjie/agent-hub", tag = "v0.2.8" }
+agent-hub = { git = "https://github.com/zhoupengjie/agent-hub", tag = "v0.2.8" }
 ```
 
 ```rust
